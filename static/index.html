@@ -1457,6 +1457,7 @@
         // OpenAI cache population has no separate write-token charge.
         const PRICING = {
             // Azure OpenAI Global Standard pricing, USD per million tokens.
+            'gpt-6-astra':          { input: 10.00,  cached: 1.00,   output: 50.0 },
             'gpt-5.6-sol':          { input: 5.00,   cached: 0.50,   output: 30.0 },
             'gemini-2.5-pro':       { input: 1.5625, cached: 0.3125, output: 10.0 },
             'gemini-2.5-flash':     { input: 0.1875, cached: 0.0375, output: 0.60 },

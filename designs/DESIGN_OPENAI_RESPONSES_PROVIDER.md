@@ -53,7 +53,21 @@ https://RESOURCE.services.ai.azure.com/api/projects/PROJECT/openai/v1
 
 Authentication uses `Authorization: Bearer` with `OPENAI_API_KEY`, falling
 back to `LLM_API_KEY`, matching the OpenAI-compatible v1 interface exposed by
-Azure AI Foundry. Credentials remain environment-only.
+Azure AI Foundry. Azure API Management hosts (`*.azure-api.net`) instead take
+the key in an `api-key` header, selected from the endpoint host. Credentials
+remain environment-only.
+
+A model may set `api_key_env` in its `openai_compat` table to name a different
+environment variable to read. This exists because `[[ai.additional_models]]`
+entries each carry their own `openai_compat`, so two Azure deployments can run
+concurrently on separate gateways, but the key was otherwise process-global and
+necessarily shared. The setting holds a variable *name*, preserving the
+environment-only rule above; the secret never enters configuration. Naming a
+variable asserts it exists, so an unset or empty value fails provider
+construction rather than sending an unauthenticated request -- which additional
+models degrade into a recorded unavailable source rather than a review abort.
+This is deliberately stricter than the fallback path, which stays lenient for
+existing configurations.
 
 On Azure, `model` is the deployment name rather than necessarily the upstream
 OpenAI model identifier.

@@ -257,6 +257,17 @@ pub struct OpenAiCompatSettings {
     /// by Chat Completions providers.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Name of the environment variable holding this model's API key -- the
+    /// variable name, never the secret itself. Lets two Azure deployments on
+    /// different gateways authenticate with different subscription keys, since
+    /// `[[ai.additional_models]]` entries each carry their own `openai_compat`
+    /// table. Naming a variable asserts that it exists, so a missing or empty
+    /// value fails provider construction rather than sending an unauthenticated
+    /// request; leave unset to fall back to `OPENAI_API_KEY` then `LLM_API_KEY`.
+    /// Honored only by `provider = "openai-responses"`; Chat Completions
+    /// providers always use the fallback variables.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1211,6 +1222,83 @@ mod tests {
         let openai = effective.openai_compat.unwrap();
         assert_eq!(openai.max_tokens, Some(16384));
         assert_eq!(openai.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// Two Azure gateways must not bleed into each other. `openai_compat` is a
+    /// sub-table of an array element, so it binds to the most recently declared
+    /// `[[ai.additional_models]]` -- a misplaced block silently reconfigures the
+    /// wrong model instead of failing to parse.
+    #[test]
+    fn two_azure_responses_models_keep_separate_endpoints_and_keys() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            ai: AiSettings,
+        }
+
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+                [ai]
+                provider = "bedrock"
+                model = "opus-primary"
+
+                [[ai.additional_models]]
+                name = "azure-one"
+                probability = 1.0
+                provider = "openai-responses"
+                model = "gpt-5.6-one"
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://gateway-one.azure-api.net/openai/responses?api-version=2025-04-01-preview"
+                api_key_env = "AZURE_GATEWAY_ONE"
+                context_window_size = 400000
+
+                [[ai.additional_models]]
+                name = "azure-two"
+                probability = 0.5
+                provider = "openai-responses"
+                model = "gpt-5.6-two"
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://gateway-two.azure-api.net/openai/responses?api-version=2025-04-01-preview"
+                api_key_env = "AZURE_GATEWAY_TWO"
+                context_window_size = 200000
+            "#,
+        )
+        .unwrap();
+        let ai = wrapper.ai;
+        assert_eq!(ai.additional_models.len(), 2);
+
+        let first = ai.additional_models[0].effective_ai(&ai);
+        let first_openai = first.openai_compat.unwrap();
+        assert_eq!(
+            first_openai.api_key_env.as_deref(),
+            Some("AZURE_GATEWAY_ONE")
+        );
+        assert_eq!(
+            first_openai.base_url.as_deref(),
+            Some(
+                "https://gateway-one.azure-api.net/openai/responses?api-version=2025-04-01-preview"
+            )
+        );
+        assert_eq!(first_openai.context_window_size, Some(400000));
+
+        let second = ai.additional_models[1].effective_ai(&ai);
+        let second_openai = second.openai_compat.unwrap();
+        assert_eq!(
+            second_openai.api_key_env.as_deref(),
+            Some("AZURE_GATEWAY_TWO")
+        );
+        assert_eq!(
+            second_openai.base_url.as_deref(),
+            Some(
+                "https://gateway-two.azure-api.net/openai/responses?api-version=2025-04-01-preview"
+            )
+        );
+        assert_eq!(second_openai.context_window_size, Some(200000));
+
+        // Both still inherit the main model's non-openai settings.
+        assert_eq!(first.model, "gpt-5.6-one");
+        assert_eq!(second.model, "gpt-5.6-two");
     }
 
     #[test]

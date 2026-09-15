@@ -9,3 +9,9 @@ base_url = "https://YOUR-RESOURCE.services.ai.azure.com/api/projects/YOUR-PROJEC
 context_window_size = 400000
 max_tokens = 16384
 reasoning_effort = "high"
+
+# Name of the environment variable holding the API key -- the variable name, not
+# the key. Only needed to point a model at something other than the shared
+# OPENAI_API_KEY / LLM_API_KEY, which is what lets two deployments on separate
+# endpoints use separate keys. See docs/llm-providers.md.
+# api_key_env = "AZURE_GATEWAY_ONE"

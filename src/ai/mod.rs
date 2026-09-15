@@ -570,6 +570,20 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(4096);
 
+            // Chat Completions has no per-model key plumbing, so silently
+            // ignoring this would authenticate against the wrong tenant.
+            if let Some(name) = ai
+                .openai_compat
+                .as_ref()
+                .and_then(|c| c.api_key_env.as_ref())
+            {
+                tracing::warn!(
+                    "api_key_env = {name} is ignored by provider {}; only openai-responses honors \
+                     it, so OPENAI_API_KEY/LLM_API_KEY will be used instead",
+                    ai.provider
+                );
+            }
+
             let provider = openai::OpenAiCompatClient::new(
                 base_url,
                 provider_type,
@@ -591,6 +605,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(openai_responses::DEFAULT_MAX_OUTPUT_TOKENS);
             let reasoning_effort = cfg.and_then(|c| c.reasoning_effort.clone());
+            let api_key_env = cfg.and_then(|c| c.api_key_env.clone());
 
             Ok(Arc::new(openai_responses::OpenAiResponsesClient::new(
                 base_url,
@@ -599,6 +614,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 max_tokens,
                 ai.api_timeout_secs,
                 reasoning_effort,
+                api_key_env,
             )?))
         }
         "ollama" => {

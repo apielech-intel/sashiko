@@ -111,6 +111,10 @@ prompt_caching = true
 
 # [ai.openai_compat]        # Enable openrouter url
 # base_url = "https://openrouter.ai/api/v1"
+# Name of the env var holding this model's API key (the variable name, never the
+# key). Responses API only; unset falls back to OPENAI_API_KEY then LLM_API_KEY.
+# Lets two Azure deployments on separate endpoints use separate keys.
+# api_key_env = "AZURE_GATEWAY_ONE"
 
 # [ai.vertex]
 # project_id = "my-gcp-project"  # Or set ANTHROPIC_VERTEX_PROJECT_ID env var

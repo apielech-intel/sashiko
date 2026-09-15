@@ -28,6 +28,7 @@ use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
+use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -120,22 +121,27 @@ impl OpenAiResponsesClient {
         max_tokens: u32,
         api_timeout_secs: u64,
         reasoning_effort: Option<String>,
+        api_key_env: Option<String>,
     ) -> Result<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .unwrap_or_default();
+        let api_key =
+            Self::resolve_api_key(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
 
         let endpoint = Self::normalize_base_url(&base_url)?;
 
+        // Naming the variable rather than the key means a typo in `api_key_env`
+        // is silently ignored and falls back to the shared key, so record which
+        // variable actually authenticated this provider.
+        tracing::info!(
+            "OpenAI Responses provider for {model} authenticating with {}",
+            api_key_env
+                .as_deref()
+                .unwrap_or("OPENAI_API_KEY/LLM_API_KEY")
+        );
+
         let mut headers = reqwest::header::HeaderMap::new();
         if !api_key.is_empty() {
-            if Self::uses_azure_api_key(&endpoint) {
-                let value = reqwest::header::HeaderValue::from_str(&api_key)?;
-                headers.insert("api-key", value);
-            } else {
-                let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))?;
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-            }
+            let (name, value) = Self::auth_header(&endpoint, &api_key)?;
+            headers.insert(name, value);
         }
 
         let client = Client::builder()
@@ -155,6 +161,56 @@ impl OpenAiResponsesClient {
 
     pub fn default_base_url() -> String {
         "https://api.openai.com/v1".to_string()
+    }
+
+    /// Resolves the API key, reading the environment through `lookup` so the
+    /// policy is testable without mutating process-global state.
+    ///
+    /// `api_key_env` names the variable to read. Naming one asserts that it
+    /// exists, so a missing or empty value is an error rather than a silently
+    /// unauthenticated request -- otherwise the failure only surfaces as a 401
+    /// partway through a review. Without it, fall back to the shared variables,
+    /// which stay lenient for compatibility with existing configs.
+    fn resolve_api_key(
+        api_key_env: Option<&str>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<String> {
+        if let Some(name) = api_key_env {
+            // Trimmed because `export KEY=$(cat file)` keeps the trailing
+            // newline, which HeaderValue rejects with an opaque parse error.
+            let key = lookup(name).unwrap_or_default().trim().to_string();
+            if key.is_empty() {
+                return Err(anyhow!(
+                    "api_key_env names {name}, but it is unset or empty in the environment"
+                ));
+            }
+            return Ok(key);
+        }
+
+        Ok(lookup("OPENAI_API_KEY")
+            .or_else(|| lookup("LLM_API_KEY"))
+            .unwrap_or_default()
+            .trim()
+            .to_string())
+    }
+
+    /// Builds the authentication header for `endpoint`.
+    ///
+    /// Azure API Management gateways take the subscription key in `api-key`;
+    /// OpenAI and Azure AI Foundry's OpenAI-compatible endpoints take a bearer
+    /// token.
+    fn auth_header(endpoint: &str, api_key: &str) -> Result<(HeaderName, HeaderValue)> {
+        if Self::uses_azure_api_key(endpoint) {
+            Ok((
+                HeaderName::from_static("api-key"),
+                HeaderValue::from_str(api_key)?,
+            ))
+        } else {
+            Ok((
+                reqwest::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+            ))
+        }
     }
 
     /// Accept either an API root ending in `/v1` (including Azure Foundry
@@ -715,6 +771,100 @@ mod tests {
         assert!(!OpenAiResponsesClient::uses_azure_api_key(
             "https://api.openai.com/v1/responses"
         ));
+    }
+
+    /// Env lookup stub. The real environment is process-global and these tests
+    /// run threaded in one binary, so the policy is exercised through an
+    /// injected map instead of `env::set_var`.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name| {
+            owned
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn named_api_key_env_takes_precedence_over_shared_keys() -> Result<()> {
+        let lookup = env_of(&[
+            ("AZURE_GATEWAY_TWO", "second-key"),
+            ("OPENAI_API_KEY", "shared-key"),
+        ]);
+        assert_eq!(
+            OpenAiResponsesClient::resolve_api_key(Some("AZURE_GATEWAY_TWO"), lookup)?,
+            "second-key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_api_key_env_trims_trailing_newline() -> Result<()> {
+        let lookup = env_of(&[("AZURE_GATEWAY_TWO", "second-key\n")]);
+        assert_eq!(
+            OpenAiResponsesClient::resolve_api_key(Some("AZURE_GATEWAY_TWO"), lookup)?,
+            "second-key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_api_key_env_errors_when_missing_or_empty() {
+        // Naming a variable asserts it exists; falling back to the shared key
+        // here would authenticate gateway #2 with gateway #1's credentials.
+        let missing = OpenAiResponsesClient::resolve_api_key(
+            Some("AZURE_GATEWAY_TWO"),
+            env_of(&[("OPENAI_API_KEY", "shared-key")]),
+        );
+        let message = missing
+            .expect_err("missing variable must error")
+            .to_string();
+        assert!(message.contains("AZURE_GATEWAY_TWO"), "{message}");
+
+        let empty = OpenAiResponsesClient::resolve_api_key(
+            Some("AZURE_GATEWAY_TWO"),
+            env_of(&[("AZURE_GATEWAY_TWO", "   ")]),
+        );
+        assert!(empty.is_err(), "whitespace-only variable must error");
+    }
+
+    #[test]
+    fn unnamed_api_key_env_falls_back_and_stays_lenient() -> Result<()> {
+        assert_eq!(
+            OpenAiResponsesClient::resolve_api_key(None, env_of(&[("OPENAI_API_KEY", "first")]))?,
+            "first"
+        );
+        assert_eq!(
+            OpenAiResponsesClient::resolve_api_key(None, env_of(&[("LLM_API_KEY", "second")]))?,
+            "second"
+        );
+        // No key configured at all stays a warning-free empty string so that
+        // existing unauthenticated/local setups keep working.
+        assert_eq!(
+            OpenAiResponsesClient::resolve_api_key(None, env_of(&[]))?,
+            ""
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auth_header_matches_gateway_flavor() -> Result<()> {
+        let (name, value) = OpenAiResponsesClient::auth_header(
+            "https://example.azure-api.net/openai/responses?api-version=2025-04-01-preview",
+            "apim-key",
+        )?;
+        assert_eq!(name.as_str(), "api-key");
+        assert_eq!(value.to_str()?, "apim-key");
+
+        let (name, value) =
+            OpenAiResponsesClient::auth_header("https://api.openai.com/v1/responses", "sk-token")?;
+        assert_eq!(name, reqwest::header::AUTHORIZATION);
+        assert_eq!(value.to_str()?, "Bearer sk-token");
+        Ok(())
     }
 
     #[test]

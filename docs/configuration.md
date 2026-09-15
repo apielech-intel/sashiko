@@ -227,6 +227,46 @@ provider (`provider = "openai-responses"`).
 | `context_window_size` | integer | -- | Context window size (optional). |
 | `max_tokens` | integer | provider-specific | Max output tokens. Defaults to `4096` for Chat Completions and `16384` for Responses, whose limit also includes reasoning tokens. |
 | `reasoning_effort` | string | -- | Responses API reasoning effort, such as `low`, `medium`, or `high`; accepted values are deployment-specific and the setting is ignored by Chat Completions. |
+| `api_key_env` | string | -- | Name of the environment variable holding this model's API key -- the variable name, never the key itself. Lets two deployments on separate endpoints authenticate with different keys. Unset falls back to `OPENAI_API_KEY` then `LLM_API_KEY`; set but missing or empty from the environment is an error. Responses API only, ignored with a warning by Chat Completions. |
+
+Because each `[[ai.additional_models]]` entry carries its own `openai_compat`
+table, `api_key_env` is what makes two independently-keyed deployments possible:
+
+```toml
+[[ai.additional_models]]
+name = "azure-one"
+provider = "openai-responses"
+model = "gpt-5.6-one"
+probability = 1.0
+
+[ai.additional_models.openai_compat]
+base_url = "https://gateway-one.azure-api.net/openai/responses?api-version=2025-04-01-preview"
+api_key_env = "AZURE_GATEWAY_ONE"
+context_window_size = 400000
+
+[[ai.additional_models]]
+name = "azure-two"
+provider = "openai-responses"
+model = "gpt-5.6-two"
+probability = 0.5
+
+[ai.additional_models.openai_compat]
+base_url = "https://gateway-two.azure-api.net/openai/responses?api-version=2025-04-01-preview"
+api_key_env = "AZURE_GATEWAY_TWO"
+context_window_size = 400000
+```
+
+An `openai_compat` sub-table binds to the most recently declared
+`[[ai.additional_models]]`, so each block must sit between its own entry header
+and the next one. Misplacing it silently reconfigures the wrong model rather
+than failing to parse. Note also that the table is replaced wholesale rather than
+merged with a top-level `[ai.openai_compat]`, so each entry must repeat every
+value it needs.
+
+The named variable must be present in the environment of the process that builds
+the provider. For the daemon that is the daemon itself: it constructs the
+additional-model providers and proxies their traffic, and deliberately clears the
+environment of the `review` child so that no API key is passed down.
 
 #### `[ai.kiro_cli]`
 
@@ -561,7 +601,7 @@ it to its full embargo window instead of releasing it early.
 | `LLM_API_KEY` | API key for the configured LLM provider (universal fallback). |
 | `GEMINI_API_KEY` | API key for Gemini (takes precedence over `LLM_API_KEY`). |
 | `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `LLM_API_KEY`). |
-| `OPENAI_API_KEY` | API key for OpenAI-compatible and Responses providers (takes precedence over `LLM_API_KEY`). |
+| `OPENAI_API_KEY` | API key for OpenAI-compatible and Responses providers (takes precedence over `LLM_API_KEY`). A Responses model can name a different variable instead via `api_key_env`. |
 | `ANTHROPIC_BASE_URL` | Override the Claude API base URL (for proxies). |
 | `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI provider. |
 | `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |

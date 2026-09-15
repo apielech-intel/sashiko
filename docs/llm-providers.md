@@ -294,16 +294,18 @@ require the preview API can use a URL such as
 
 Azure API Management gateway endpoints may instead use a complete URL such as
 `https://RESOURCE.azure-api.net/openai/responses?api-version=VERSION`. For
-`.azure-api.net` hosts, Sashiko sends `OPENAI_API_KEY` in Azure's `api-key`
-header; OpenAI and Azure AI Foundry v1 endpoints continue to use bearer auth.
+`.azure-api.net` hosts, Sashiko sends the API key in Azure's `api-key` header;
+OpenAI and Azure AI Foundry v1 endpoints continue to use bearer auth. The header
+is chosen from the endpoint host, so a gateway on a custom domain would be sent
+a bearer token and reject it.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
 cp docs/examples/Settings.azure-openai-responses.toml Settings.toml
 ```
 
-The provider uses bearer authentication, requests encrypted reasoning content,
-and replays that opaque item on later tool-call turns. Requests are stateless
+The provider requests encrypted reasoning content and replays that opaque item
+on later tool-call turns. Requests are stateless
 (`store = false`), so one provider instance can safely serve concurrent review
 stages. Sampling temperature is intentionally omitted because GPT reasoning
 models may reject it. Azure/OpenAI prompt caching is automatic; cached input
@@ -332,5 +334,59 @@ reasoning_effort = "high"
 ```
 
 `probability = 1.0` runs the secondary model on every review; lower values
-sample it per patch review. Keep the API key in `OPENAI_API_KEY`, not in
+sample it per patch review. Keep the API key in the environment, not in
 `Settings.toml`.
+
+### Two Azure deployments with separate keys
+
+Each `[[ai.additional_models]]` entry carries its own `openai_compat` table, so
+two deployments can run side by side on different endpoints. To give them
+different API keys, name a variable per entry with `api_key_env`:
+
+```toml
+[[ai.additional_models]]
+name = "azure-gpt"
+probability = 1.0
+provider = "openai-responses"
+model = "gpt-5.6-one"
+max_input_tokens = 200000
+
+[ai.additional_models.openai_compat]
+base_url = "https://GATEWAY-ONE.azure-api.net/openai/responses?api-version=VERSION"
+api_key_env = "AZURE_GATEWAY_ONE"
+context_window_size = 400000
+max_tokens = 16384
+reasoning_effort = "high"
+
+[[ai.additional_models]]
+name = "azure-gpt-two"
+probability = 0.5
+provider = "openai-responses"
+model = "gpt-5.6-two"
+max_input_tokens = 200000
+
+[ai.additional_models.openai_compat]
+base_url = "https://GATEWAY-TWO.azure-api.net/openai/responses?api-version=VERSION"
+api_key_env = "AZURE_GATEWAY_TWO"
+context_window_size = 400000
+max_tokens = 16384
+reasoning_effort = "high"
+```
+
+`api_key_env` holds the *name* of an environment variable, never the key itself,
+so this keeps secrets out of `Settings.toml` as before. Omitting it falls back to
+`OPENAI_API_KEY` then `LLM_API_KEY`; naming a variable that is unset or empty is
+an error, which surfaces as an unavailable review source rather than a mid-review
+401.
+
+Three things to watch:
+
+- An `openai_compat` sub-table binds to the most recently declared
+  `[[ai.additional_models]]`, so keep each block directly under its own entry.
+  A misplaced block reconfigures the wrong model without any parse error.
+- The named variable must exist in the environment of the process that builds the
+  provider. Under the daemon that is the daemon itself, which constructs the
+  additional-model providers and proxies their traffic; it clears the environment
+  of the `review` child, so no key needs to reach the child.
+- Add each new deployment name to the `PRICING` table in `static/index.html`, or
+  its reviews report no cost in the UI.

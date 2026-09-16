@@ -349,6 +349,11 @@ pub struct AdditionalModelSettings {
     /// Use the alternative Rust-owned prompt profile for this experiment source.
     #[serde(default)]
     pub alternative_prompts: bool,
+    /// Preference for confirming main-only findings. The eligible variant with
+    /// the highest value confirms; equal values fall back to the variant name
+    /// order. Negative values rank a variant below the unset default.
+    #[serde(default)]
+    pub confirm_priority: i32,
     #[serde(default)]
     pub budget: SourceBudgetSettings,
     #[serde(default)]
@@ -1185,6 +1190,93 @@ mod tests {
         .unwrap();
         assert_eq!(experiments.validation_budget.request_input_tokens, 300);
         assert_eq!(experiments.validation_budget.review_output_tokens, 400);
+    }
+
+    /// An omitted key must leave the confirmer choice exactly where it was, and a
+    /// negative value has to be accepted so a model can be ranked below the
+    /// unset default without renumbering every other entry.
+    #[test]
+    fn confirm_priority_defaults_to_zero_and_accepts_negatives() {
+        let unset: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
+            "name": "variant",
+            "probability": 0.5
+        }))
+        .unwrap();
+        assert_eq!(unset.confirm_priority, 0);
+
+        let promoted: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
+            "name": "variant",
+            "probability": 0.5,
+            "confirm_priority": 10
+        }))
+        .unwrap();
+        assert_eq!(promoted.confirm_priority, 10);
+
+        let demoted: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
+            "name": "variant",
+            "probability": 0.5,
+            "confirm_priority": -1
+        }))
+        .unwrap();
+        assert_eq!(demoted.confirm_priority, -1);
+    }
+
+    /// `confirm_priority` has to be declared above the entry's provider
+    /// sub-table. Below it the key belongs to `openai_compat`, which accepts
+    /// unknown keys, so the priority would be silently dropped.
+    #[test]
+    fn confirm_priority_binds_to_its_own_azure_entry() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            ai: AiSettings,
+        }
+
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+                [ai]
+                provider = "bedrock"
+                model = "opus-primary"
+
+                [[ai.additional_models]]
+                name = "azure-one"
+                probability = 1.0
+                provider = "openai-responses"
+                model = "gpt-5.6-one"
+                confirm_priority = 5
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://gateway-one.azure-api.net/openai/responses"
+
+                [[ai.additional_models]]
+                name = "azure-two"
+                probability = 1.0
+                provider = "openai-responses"
+                model = "gpt-6-two"
+                confirm_priority = 10
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://gateway-two.azure-api.net/openai/responses"
+            "#,
+        )
+        .unwrap();
+        let ai = wrapper.ai;
+
+        assert_eq!(ai.additional_models[0].confirm_priority, 5);
+        assert_eq!(ai.additional_models[1].confirm_priority, 10);
+        assert_eq!(
+            ai.additional_models[0]
+                .openai_compat
+                .as_ref()
+                .and_then(|openai| openai.base_url.as_deref()),
+            Some("https://gateway-one.azure-api.net/openai/responses")
+        );
+        assert_eq!(
+            ai.additional_models[1]
+                .openai_compat
+                .as_ref()
+                .and_then(|openai| openai.base_url.as_deref()),
+            Some("https://gateway-two.azure-api.net/openai/responses")
+        );
     }
 
     #[test]

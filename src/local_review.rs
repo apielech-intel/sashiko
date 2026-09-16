@@ -541,6 +541,7 @@ async fn review_single_patch(
                     provider_id,
                     budget: Some(ReviewBudget::new(variant_ai.discovery_budget_config())),
                     alternative_prompts: model.alternative_prompts,
+                    confirm_priority: model.confirm_priority,
                 }
             })
             .collect::<Vec<_>>();

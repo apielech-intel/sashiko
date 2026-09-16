@@ -312,6 +312,7 @@ pub struct AdditionalModelRunner {
     pub provider_id: String,
     pub budget: Option<ReviewBudget>,
     pub alternative_prompts: bool,
+    pub confirm_priority: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -2337,6 +2338,11 @@ Example:
             .iter()
             .map(|model| (model.name.as_str(), model.provider_id.as_str()))
             .collect();
+        let confirm_priorities: BTreeMap<&str, i32> = self
+            .additional_models
+            .iter()
+            .map(|model| (model.name.as_str(), model.confirm_priority))
+            .collect();
         let mut accepted = vec![true; items.len()];
 
         for (index, concern) in items.iter().enumerate() {
@@ -2411,8 +2417,19 @@ Example:
                 continue;
             }
             let discoverer = models.first().copied().unwrap_or("main");
+            // The confirmer is chosen, not stumbled upon: the eligible variant
+            // with the highest confirm_priority wins, and equal priorities fall
+            // back to the name order ran_models is already sorted in. Naming the
+            // tie-break in the key matters -- max_by_key returns the *last* of
+            // several equally-ranked variants, which would silently flip that
+            // fallback to reverse alphabetical.
             let confirmer = if discoverer == "main" {
-                ran_models.first().copied()
+                ran_models.iter().copied().min_by_key(|model| {
+                    (
+                        std::cmp::Reverse(confirm_priorities.get(*model).copied().unwrap_or(0)),
+                        *model,
+                    )
+                })
             } else {
                 Some("main")
             };
@@ -2461,6 +2478,7 @@ Example:
                     model.provider_id.as_str(),
                 )
             };
+            info!("Confirming {} finding(s) with {confirmer}", batch.len());
             let payload: Vec<Value> = batch
                 .iter()
                 .map(|target| {
@@ -4402,6 +4420,24 @@ mod tests {
         cohort
     }
 
+    fn test_cohort_with_variants(names: &[&str]) -> crate::ai::model_experiment::ReviewCohort {
+        let mut cohort = test_cohort();
+        for name in names {
+            cohort
+                .variants
+                .push(crate::ai::model_experiment::CohortMember {
+                    source: crate::ai::model_experiment::SourceIdentity {
+                        name: (*name).to_string(),
+                        display_name: (*name).to_string(),
+                        provider: "test".to_string(),
+                        model: format!("{name}-model"),
+                    },
+                    selected: true,
+                });
+        }
+        cohort
+    }
+
     #[tokio::test]
     async fn stage_eleven_requires_source_annotations() {
         let temp = tempfile::tempdir().unwrap();
@@ -5540,6 +5576,7 @@ mod tests {
                     provider_id: "test".to_string(),
                     budget: None,
                     alternative_prompts: false,
+                    confirm_priority: 0,
                 }],
                 cohort: crate::ai::model_experiment::ReviewCohort {
                     main: crate::ai::model_experiment::SourceIdentity {
@@ -5622,6 +5659,7 @@ mod tests {
                     provider_id: "test".to_string(),
                     budget: None,
                     alternative_prompts: false,
+                    confirm_priority: 0,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -5693,6 +5731,7 @@ mod tests {
                     provider_id: "test".to_string(),
                     budget: None,
                     alternative_prompts: false,
+                    confirm_priority: 0,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -5728,6 +5767,168 @@ mod tests {
         assert_eq!(comparisons[0]["preexisting"], true);
     }
 
+    /// The main provider fails on purpose: a main-only finding must be judged by
+    /// a variant, so any request reaching main would be a routing bug.
+    fn confirm_priority_worker(
+        temp: &tempfile::TempDir,
+        variants: &[(&str, i32, Arc<ConfirmationProvider>)],
+    ) -> Worker {
+        let names: Vec<&str> = variants.iter().map(|(name, _, _)| *name).collect();
+        Worker::new(
+            Arc::new(FailingConfirmationProvider),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            PromptRegistry::new(temp.path().to_path_buf()),
+            WorkerConfig {
+                main_model: "model-a".to_string(),
+                max_input_tokens: 1000,
+                max_interactions: 2,
+                analysis_stage_parallelism: 1,
+                temperature: 0.0,
+                custom_prompt: None,
+                series_range: None,
+                baseline_sha: None,
+                stages: None,
+                dump_conversation: None,
+                budget: None,
+                merge_budget: None,
+                retry_provider: None,
+                additional_models: variants
+                    .iter()
+                    .map(|(name, priority, provider)| AdditionalModelRunner {
+                        name: (*name).to_string(),
+                        provider: provider.clone(),
+                        temperature: 0.0,
+                        max_interactions: 2,
+                        model_id: format!("{name}-model"),
+                        provider_id: "test".to_string(),
+                        budget: None,
+                        alternative_prompts: false,
+                        confirm_priority: *priority,
+                    })
+                    .collect(),
+                cohort: test_cohort_with_variants(&names),
+                validation_budget: None,
+            },
+        )
+    }
+
+    fn main_only_confirmation_inputs() -> (Value, Value) {
+        (
+            json!([{
+                "finding_ids": ["a"],
+                "source_models": ["main"],
+                "source_stages": [3],
+                "severity": "High",
+                "preexisting": false
+            }]),
+            json!([
+                {"model": "main", "stage": 3, "status": "completed"},
+                {"model": "variant-a", "stage": 3, "status": "completed"},
+                {"model": "variant-b", "stage": 3, "status": "completed"}
+            ]),
+        )
+    }
+
+    /// Both variants ran the finding's stage, so confirm_priority is the only
+    /// thing that can decide which one adjudicates.
+    #[tokio::test]
+    async fn confirm_priority_selects_the_confirmer_among_eligible_variants() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_by_name = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let prioritized = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = confirm_priority_worker(
+            &temp,
+            &[
+                ("variant-a", 0, first_by_name.clone()),
+                ("variant-b", 10, prioritized.clone()),
+            ],
+        );
+        let (findings, runs) = main_only_confirmation_inputs();
+
+        let (accepted, comparisons, confirmation_runs) = worker
+            .confirm_unique_findings(
+                "context",
+                &findings,
+                runs.as_array().unwrap(),
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(accepted.as_array().unwrap().len(), 1);
+        assert_eq!(
+            prioritized.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            first_by_name
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(confirmation_runs.len(), 1);
+        assert_eq!(confirmation_runs[0]["model"], "variant-b");
+        // Every eligible variant keeps its comparison row; only the adjudicator
+        // is chosen by priority.
+        assert_eq!(comparisons.len(), 2);
+        for comparison in &comparisons {
+            assert_eq!(comparison["outcome"], "main_only");
+            assert_eq!(comparison["confirmed_by"], "variant-b");
+        }
+    }
+
+    /// Equal priorities must keep the historical variant name order, so that
+    /// enabling the field on one model does not reshuffle every other pair.
+    #[tokio::test]
+    async fn equal_confirm_priority_falls_back_to_variant_name_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_by_name = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let second_by_name = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = confirm_priority_worker(
+            &temp,
+            &[
+                ("variant-b", 0, second_by_name.clone()),
+                ("variant-a", 0, first_by_name.clone()),
+            ],
+        );
+        let (findings, runs) = main_only_confirmation_inputs();
+
+        let (_, comparisons, confirmation_runs) = worker
+            .confirm_unique_findings(
+                "context",
+                &findings,
+                runs.as_array().unwrap(),
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_by_name
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            second_by_name
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(confirmation_runs.len(), 1);
+        assert_eq!(confirmation_runs[0]["model"], "variant-a");
+        assert_eq!(comparisons.len(), 2);
+        assert_eq!(comparisons[0]["confirmed_by"], "variant-a");
+    }
+
     #[tokio::test]
     async fn failed_confirmation_reports_unconfirmed_variant_findings() {
         let temp = tempfile::tempdir().unwrap();
@@ -5758,6 +5959,7 @@ mod tests {
                     provider_id: "test".to_string(),
                     budget: None,
                     alternative_prompts: false,
+                    confirm_priority: 0,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -6474,6 +6676,7 @@ mod tests {
                 provider_id: "test".to_string(),
                 budget: None,
                 alternative_prompts: true,
+                confirm_priority: 0,
             }],
             cohort: test_variant_cohort(),
             validation_budget: None,

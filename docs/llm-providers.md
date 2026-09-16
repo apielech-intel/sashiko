@@ -350,6 +350,7 @@ probability = 1.0
 provider = "openai-responses"
 model = "gpt-5.6-one"
 max_input_tokens = 200000
+confirm_priority = 10
 
 [ai.additional_models.openai_compat]
 base_url = "https://GATEWAY-ONE.azure-api.net/openai/responses?api-version=VERSION"
@@ -364,6 +365,7 @@ probability = 0.5
 provider = "openai-responses"
 model = "gpt-5.6-two"
 max_input_tokens = 200000
+confirm_priority = 5
 
 [ai.additional_models.openai_compat]
 base_url = "https://GATEWAY-TWO.azure-api.net/openai/responses?api-version=VERSION"
@@ -379,11 +381,19 @@ so this keeps secrets out of `Settings.toml` as before. Omitting it falls back t
 an error, which surfaces as an unavailable review source rather than a mid-review
 401.
 
+`confirm_priority` decides which deployment confirms a finding that only the main
+model reported. Two deployments at `probability = 1.0` are both eligible on every
+review, and without a priority the winner is just whichever name sorts first, so
+one of them may never confirm anything. See
+[`[[ai.additional_models]]`](configuration.md#aiadditional_models).
+
 Three things to watch:
 
 - An `openai_compat` sub-table binds to the most recently declared
   `[[ai.additional_models]]`, so keep each block directly under its own entry.
-  A misplaced block reconfigures the wrong model without any parse error.
+  A misplaced block reconfigures the wrong model without any parse error. The
+  same applies to plain keys: a `confirm_priority` written below the sub-table
+  header becomes an unknown key of that table and is silently dropped.
 - The named variable must exist in the environment of the process that builds the
   provider. Under the daemon that is the daemon itself, which constructs the
   additional-model providers and proxies their traffic; it clears the environment

@@ -138,7 +138,7 @@ The experiment validation planner applies these rules:
 | Discovery sources | Validation |
 |---|---|
 | main and one or more variants | Shared; no confirmation |
-| main only | One eligible variant confirms |
+| main only | The eligible variant with the highest confirm priority confirms; equal priorities use the variant name order |
 | one variant only | Main confirms |
 | multiple variants, no main | Shared; no confirmation |
 
@@ -217,6 +217,7 @@ name = "opus"
 name = "sonnet"
 probability = 0.10
 model = "claude-sonnet-4-6"
+confirm_priority = 10
 
 [[ai.additional_models]]
 name = "legacy-prompts"
@@ -245,6 +246,11 @@ review_output_tokens = 12000
 Additional-model provider and generation settings continue to inherit from the
 main AI configuration. Names contain only ASCII letters, digits, `_`, or `-`;
 `main` is reserved. Probability is inclusive from 0.0 through 1.0.
+
+`confirm_priority` is an integer, defaults to 0, and may be negative. It orders
+confirmer selection only: sampling, discovery, and budget ownership are
+unaffected, and a variant that did not complete the finding's stages is never
+selected however high its priority.
 
 ## Persistence
 

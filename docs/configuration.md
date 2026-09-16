@@ -125,11 +125,20 @@ the planner selects for the main model. The main model always runs. Unspecified
 settings inherit from `[ai]`; provider-specific tables may also be specified on
 an additional model. `probability` must be between `0.0` and `1.0`.
 
+A finding that only the main model reported is confirmed by one of the models
+that ran the same stage, and `confirm_priority` decides which one. Without it
+the choice falls to the variant name order, which is not a ranking. Declare the
+key under its own `[[ai.additional_models]]` header and above any
+`[ai.additional_models.*]` sub-table: below a sub-table header the key belongs
+to that sub-table, which accepts unknown keys, so the priority is dropped
+without an error.
+
 ```toml
 [[ai.additional_models]]
 name = "sonnet"
 model = "claude-sonnet-4-6"
 probability = 0.10
+confirm_priority = 10
 
 [ai.additional_models.budget]
 stage_input_tokens = 120000
@@ -161,6 +170,7 @@ alternative_prompts = true
 | `max_interactions` | integer | main setting | Tool-call round limit override. |
 | `api_timeout_secs` | integer | main setting | Provider request timeout override. |
 | `alternative_prompts` | boolean | `false` | Use the alternative Rust prompt profile while retaining the selected provider/model settings and vendored guidance. |
+| `confirm_priority` | integer | `0` | Preference for confirming findings only the main model reported. Among the models that completed the finding's stages, the highest value confirms; equal values fall back to the model name order. May be negative to rank a model below the unset default. |
 
 Each selected model owns an independent budget ledger. The optional
 `[ai.additional_models.budget]` table accepts the same keys as `[ai.budget]`
@@ -185,7 +195,9 @@ Confirmation requests use independent ledgers keyed by confirming source.
 
 Budget exhaustion makes confirmation unavailable. It is not interpreted as a
 rejection: main-only findings fall back to normal Stage 10 verification, while
-variant-only findings are not published without main confirmation.
+variant-only findings are not published without main confirmation. A confirmer
+that fails or exhausts its ledger does not hand the batch to the next model by
+priority; the findings degrade to their Stage 10 baseline decision instead.
 
 #### `[ai.claude]`
 

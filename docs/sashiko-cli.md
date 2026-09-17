@@ -193,6 +193,50 @@ from a browser, through the "Lift now" button on the patchset page; that goes to
 a separate endpoint that authorizes on the token instead of on the origin, and
 leaves this one loopback-only.
 
+### priority
+
+Mark a pending patchset high priority, so it is reviewed ahead of the queue.
+Reviews are otherwise dispatched oldest-first, so a backlog of a hundred series is
+a long wait for the last one in.
+
+Despite sitting next to `lift-embargo` in this list, this has nothing to do with
+embargoes: it changes *when* a patchset is reviewed, not when its findings are
+published.
+
+```
+sashiko-cli priority [OPTIONS] <ID>
+```
+
+`ID` is a patchset ID, slug, or the message-ID of the cover letter or of any
+patch in the series -- the same keys `show` accepts.
+
+| Flag | Description |
+|------|-------------|
+| `--clear` | Return the patchset to ordinary oldest-first queue order. |
+| `--level <N>` | Priority level to set; higher is reviewed sooner (default 1). |
+
+```bash
+sashiko-cli priority 5227
+sashiko-cli priority 20260831025441.635045-7-wei.fang@oss.nxp.com
+sashiko-cli priority --clear 5227
+```
+
+The command reports the patchset's new place in the queue, not a started review.
+It reorders the queue and nothing else: no review already running is cancelled to
+make room, so the patchset starts when the next review slot frees up. Two
+prioritized patchsets are still oldest-first between themselves, and a higher
+`--level` outranks a lower one.
+
+Only a patchset that is still `Pending` can be prioritized; `Not modified` is
+reported for anything else, since a review already under way is past the point
+where the queue order decides anything. The marker is sticky and survives a review
+that fails or that a restarted daemon returns to the queue, so clear it with
+`--clear` once it has served its purpose.
+
+It requires the same access as `cancel` and `rerun`: the request must come from
+loopback, unless the daemon was started with `--enable-unsafe-all-submit`, and a
+read-only daemon refuses it outright.
+
 ### local
 
 Run a local review without requiring a running daemon, database, or network

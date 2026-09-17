@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     cross_reviewed_at INTEGER,
     cross_review_generation INTEGER NOT NULL DEFAULT 0,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
+    priority INTEGER NOT NULL DEFAULT 0, -- higher is dispatched sooner; 0 is normal
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)

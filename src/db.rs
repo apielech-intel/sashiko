@@ -111,6 +111,9 @@ pub struct PatchsetRow {
     pub budget_flags_or: Option<i64>,
     pub cross_review_status: Option<String>,
     pub cross_reviewed_at: Option<i64>,
+    /// Dispatch priority: higher is reviewed sooner, 0 is an ordinary place in
+    /// the queue. See [`Database::set_patchset_priority`].
+    pub priority: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +168,46 @@ pub enum EmbargoLift {
     NotEmbargoed,
     NotFound,
 }
+
+/// Outcome of a manual change to a patchset's dispatch priority, with the
+/// refusals kept apart the way [`EmbargoLift`]'s are so the caller can say
+/// which one it hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PriorityChange {
+    /// The priority was written. Both the old and the new value are reported
+    /// because the same endpoint raises and clears it.
+    Changed {
+        was: i64,
+        now: i64,
+        /// Where the patchset sits in the pending queue after the write,
+        /// counting from 1, and how deep that queue is. Only the dispatch
+        /// order decides these, not the review capacity that drains it.
+        position: usize,
+        pending: usize,
+    },
+    /// The patchset already carried this priority; nothing was written.
+    Unchanged {
+        priority: i64,
+        position: usize,
+        pending: usize,
+    },
+    /// The patchset is not waiting for review, so its place in the queue is
+    /// not a thing that can be changed. A review already running is not
+    /// interrupted and a finished one has nothing to reorder.
+    NotPending {
+        status: String,
+    },
+    NotFound,
+}
+
+/// Dispatch order of the review queue, shared by the read that feeds the
+/// reviewer loop and the position a priority change reports back, so the number
+/// the UI shows is the order the loop will actually use.
+///
+/// `id` breaks a tie on `date`: several patches of one send-email run share a
+/// timestamp, and without it the queue position of such a row is not stable
+/// between two reads of the same unchanged queue.
+const PENDING_QUEUE_ORDER: &str = "priority DESC, date ASC, id ASC";
 
 /// How long an embargo release claim (`embargo_release_started_at`) is honoured
 /// before it is treated as abandoned and the patchset becomes eligible again.
@@ -675,6 +718,9 @@ impl Database {
                 "cross_review_generation",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority", "INTEGER NOT NULL DEFAULT 0")
             .await;
         self.migrate_cross_review_job_generations().await?;
         let _ = self
@@ -5013,7 +5059,7 @@ impl Database {
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
              p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug,
              d.concerns_total, d.concerns_unique, d.findings_multi_stage, b.budget_flags_or,
-             p.cross_review_status, p.cross_reviewed_at
+             p.cross_review_status, p.cross_reviewed_at, p.priority
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -5162,6 +5208,7 @@ impl Database {
                         // review itself is readable.
                         cross_review_status: if is_embargoed { None } else { row.get(28).ok() },
                         cross_reviewed_at: if is_embargoed { None } else { row.get(29).ok() },
+                        priority: row.get(30).ok(),
                     });
                 }
                 Ok(None) => break,
@@ -5565,7 +5612,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.priority
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -5593,6 +5640,7 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            let priority: i64 = row.get(20).unwrap_or(0);
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
                     .conn
@@ -5783,7 +5831,8 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "priority": priority
             });
             // Withheld under embargo for the same reason the reviews array is:
             // cross-review completes during the local hold now, and reporting that
@@ -5798,6 +5847,21 @@ impl Database {
                 && let Some(object) = details.as_object_mut()
             {
                 object.insert("cross_review".to_string(), status);
+            }
+            // Only a queued patchset has a place in the queue, and that number is
+            // what makes the priority control worth showing: "3rd of 57 waiting"
+            // is the question the operator is actually asking. Left out for every
+            // other status, so a stale position can never read as a live one.
+            //
+            // `priority` itself is reported whatever the status, because the
+            // marker outlives the wait: a patchset dispatched while lifted keeps
+            // the flag, and hiding it would make the lift look forgotten.
+            if final_status.as_deref() == Some("Pending")
+                && let Ok((position, pending)) = self.pending_queue_position(pid).await
+                && let Some(object) = details.as_object_mut()
+            {
+                object.insert("queue_position".to_string(), position.into());
+                object.insert("queue_pending".to_string(), pending.into());
             }
             Ok(Some(details))
         } else {
@@ -6032,10 +6096,17 @@ impl Database {
         Ok(count as usize)
     }
 
+    /// Reads the head of the review queue, in dispatch order.
+    ///
+    /// `priority` sorts ahead of `date` so a patchset lifted by
+    /// [`Self::set_patchset_priority`] is in the batch the caller reads next,
+    /// however deep the backlog behind it. Among equal priorities the order is
+    /// still oldest-first, so a lift changes which patchsets go first and not
+    /// the rule that decides between them.
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug
-             FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
+            &format!("SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, priority
+             FROM patchsets WHERE status = 'Pending' ORDER BY {PENDING_QUEUE_ORDER} LIMIT ?"),
             libsql::params![limit as i64],
         ).await?;
 
@@ -6076,6 +6147,7 @@ impl Database {
                 findings_multi_stage: None,
                 cross_review_status: None,
                 cross_reviewed_at: None,
+                priority: row.get(16).ok(),
             });
         }
         Ok(patchsets)
@@ -6149,6 +6221,9 @@ impl Database {
                         findings_multi_stage: None,
                         cross_review_status: None,
                         cross_reviewed_at: None,
+                        // Release order is the embargo deadline's to decide; a
+                        // review-queue priority has no bearing on it.
+                        priority: None,
                     });
                 }
                 Ok(None) => break,
@@ -6402,6 +6477,126 @@ impl Database {
         } else {
             Ok(EmbargoLift::NotEmbargoed)
         }
+    }
+
+    /// Sets a pending patchset's dispatch priority, moving it ahead of the rest
+    /// of the queue (`priority` above 0) or back into ordinary date order (0).
+    ///
+    /// Only [`Self::get_pending_patchsets`] reads the column, so this reorders
+    /// the queue and does not touch a review that is already running: the lifted
+    /// patchset starts on the next dispatch pass that finds free capacity.
+    /// Nothing is cancelled to make room, because a review killed part-way
+    /// through has already spent its tokens.
+    ///
+    /// The priority is sticky rather than consumed on dispatch. A review that
+    /// fails, or that an interrupted daemon resets to `Pending`, is still the
+    /// one that was urgent, and a marker the operator can see and clear is
+    /// easier to reason about than one that silently expires.
+    ///
+    /// Refused for anything not `Pending`: `In Review` is past the point a queue
+    /// order decides anything, and the remaining states are not queued at all.
+    /// A rerun puts the patchset back into `Pending`, which is when its priority
+    /// can be set again.
+    pub async fn set_patchset_priority(&self, id: i64, priority: i64) -> Result<PriorityChange> {
+        // Read first so "no such patchset" and "not queued" are distinguishable
+        // from a write that simply matched no row.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, priority FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(PriorityChange::NotFound);
+        };
+        let status: String = row.get(0).unwrap_or_default();
+        let was: i64 = row.get(1).unwrap_or(0);
+        if status != "Pending" {
+            return Ok(PriorityChange::NotPending { status });
+        }
+
+        if was == priority {
+            let (position, pending) = self.pending_queue_position(id).await?;
+            return Ok(PriorityChange::Unchanged {
+                priority: was,
+                position,
+                pending,
+            });
+        }
+
+        // Guarded on the status the read saw: a patchset the reviewer loop
+        // claimed in between is `In Review`, and reordering the queue behind it
+        // would be writing a priority that can no longer be acted on.
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE patchsets SET priority = ? WHERE id = ? AND status = 'Pending'",
+                libsql::params![priority, id],
+            )
+            .await?;
+        if updated != 1 {
+            let status = self
+                .get_patchset_status(id)
+                .await?
+                .unwrap_or_else(|| "In Review".to_string());
+            return Ok(PriorityChange::NotPending { status });
+        }
+
+        let (position, pending) = self.pending_queue_position(id).await?;
+        Ok(PriorityChange::Changed {
+            was,
+            now: priority,
+            position,
+            pending,
+        })
+    }
+
+    /// Reports a pending patchset's place in the dispatch order, counting from
+    /// 1, along with the depth of the queue it sits in.
+    ///
+    /// Counts the rows that sort ahead of it under [`PENDING_QUEUE_ORDER`]
+    /// rather than reading an offset, so the answer stays right whatever the
+    /// dispatch batch size is. A patchset that is no longer pending has no
+    /// position; it reports 0, which no queued row can hold.
+    ///
+    /// A missing `date` counts as 0, which puts it at the front — the same place
+    /// SQLite's `date ASC` puts a NULL.
+    async fn pending_queue_position(&self, id: i64) -> Result<(usize, usize)> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                   (SELECT COUNT(*) FROM patchsets q
+                    WHERE q.status = 'Pending'
+                      AND (q.priority > p.priority
+                           OR (q.priority = p.priority
+                               AND (COALESCE(q.date, 0) < COALESCE(p.date, 0)
+                                    OR (COALESCE(q.date, 0) = COALESCE(p.date, 0)
+                                        AND q.id < p.id))))),
+                   (SELECT COUNT(*) FROM patchsets WHERE status = 'Pending')
+                 FROM patchsets p WHERE p.id = ? AND p.status = 'Pending'",
+                libsql::params![id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            let mut totals = self
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM patchsets WHERE status = 'Pending'",
+                    (),
+                )
+                .await?;
+            let pending = totals
+                .next()
+                .await?
+                .and_then(|row| row.get::<i64>(0).ok())
+                .unwrap_or(0);
+            return Ok((0, pending as usize));
+        };
+        let ahead: i64 = row.get(0).unwrap_or(0);
+        let pending: i64 = row.get(1).unwrap_or(0);
+        Ok(((ahead + 1) as usize, pending as usize))
     }
 
     /// Resolves the patchset keys the API accepts — numeric id, slug, or the
@@ -9149,6 +9344,193 @@ mod tests {
             db.resolve_patchset_id("absent@example.com").await.unwrap(),
             None
         );
+    }
+
+    /// A review queue deep enough that the dispatch batch does not reach the end
+    /// of it, which is the case a priority lift exists for. Ids ascend with the
+    /// posting date, so id order and date order agree and a reordering is not
+    /// mistaken for the natural one.
+    async fn setup_queue_db() -> Arc<Database> {
+        let db = setup_db().await;
+        let mut sql =
+            String::from("INSERT INTO threads (id, root_message_id) VALUES (1, 'root_queue');\n");
+        for id in 1..=25 {
+            let date = 1_780_000_000 + id * 60;
+            sql.push_str(&format!(
+                "INSERT INTO messages (message_id, thread_id, date)
+                    VALUES ('q{id}@example.com', 1, {date});
+                 INSERT INTO patchsets (id, thread_id, cover_letter_message_id, date, status)
+                    VALUES ({id}, 1, 'q{id}@example.com', {date}, 'Pending');\n"
+            ));
+        }
+        // Not queued, so its place in the queue is not a thing to change.
+        sql.push_str("UPDATE patchsets SET status = 'In Review' WHERE id = 25;\n");
+        db.conn.execute_batch(&sql).await.unwrap();
+        db
+    }
+
+    async fn queue_head(db: &Arc<Database>, limit: usize) -> Vec<i64> {
+        db.get_pending_patchsets(limit)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|patchset| patchset.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lifted_patchset_leads_the_dispatch_batch() {
+        let db = setup_queue_db().await;
+
+        // Deep in the backlog to start with: 20th of 24, so no dispatch batch
+        // this side of the whole queue would have reached it.
+        assert_eq!(queue_head(&db, 10).await[0], 1);
+        assert_eq!(
+            db.set_patchset_priority(20, 1).await.unwrap(),
+            PriorityChange::Changed {
+                was: 0,
+                now: 1,
+                position: 1,
+                pending: 24,
+            }
+        );
+        assert_eq!(queue_head(&db, 10).await[0], 20);
+
+        // One lift does not disturb the rest of the order, and the batch is
+        // still full: the queue is reordered, not filtered.
+        assert_eq!(
+            queue_head(&db, 10).await,
+            vec![20, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+
+        // Two lifted patchsets are still oldest-first between themselves, so a
+        // lift decides which rows go first and not the rule that ranks them.
+        assert!(matches!(
+            db.set_patchset_priority(4, 1).await.unwrap(),
+            PriorityChange::Changed { position: 1, .. }
+        ));
+        assert_eq!(queue_head(&db, 3).await, vec![4, 20, 1]);
+
+        // A higher priority outranks a lower one rather than merely joining it.
+        assert!(matches!(
+            db.set_patchset_priority(20, 5).await.unwrap(),
+            PriorityChange::Changed { position: 1, .. }
+        ));
+        assert_eq!(queue_head(&db, 3).await, vec![20, 4, 1]);
+    }
+
+    #[tokio::test]
+    async fn clearing_priority_returns_a_patchset_to_date_order() {
+        let db = setup_queue_db().await;
+
+        db.set_patchset_priority(20, 1).await.unwrap();
+        assert_eq!(
+            db.set_patchset_priority(20, 0).await.unwrap(),
+            PriorityChange::Changed {
+                was: 1,
+                now: 0,
+                position: 20,
+                pending: 24,
+            }
+        );
+        assert_eq!(queue_head(&db, 1).await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn priority_change_names_the_rows_it_leaves_alone() {
+        let db = setup_queue_db().await;
+
+        // Already there. Reported as a no-op rather than a success, but the
+        // position still comes back: the caller asked where this patchset sits.
+        assert_eq!(
+            db.set_patchset_priority(1, 0).await.unwrap(),
+            PriorityChange::Unchanged {
+                priority: 0,
+                position: 1,
+                pending: 24,
+            }
+        );
+
+        // Past the point a queue order decides anything. The review keeps
+        // running: nothing here interrupts one.
+        assert_eq!(
+            db.set_patchset_priority(25, 1).await.unwrap(),
+            PriorityChange::NotPending {
+                status: "In Review".to_string(),
+            }
+        );
+        assert_eq!(priority_of(&db, 25).await, 0);
+
+        assert_eq!(
+            db.set_patchset_priority(404, 1).await.unwrap(),
+            PriorityChange::NotFound
+        );
+    }
+
+    /// Reads one patchset's stored priority.
+    async fn priority_of(db: &Arc<Database>, id: i64) -> i64 {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT priority FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn priority_survives_a_review_that_lands_back_in_the_queue() {
+        let db = setup_queue_db().await;
+        db.set_patchset_priority(20, 1).await.unwrap();
+
+        // What an interrupted daemon does on restart. The patchset that was
+        // urgent before the restart is still the urgent one after it.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'In Review' WHERE id = 20",
+                (),
+            )
+            .await
+            .unwrap();
+        db.reset_reviewing_status().await.unwrap();
+
+        assert_eq!(priority_of(&db, 20).await, 1);
+        assert_eq!(queue_head(&db, 1).await, vec![20]);
+    }
+
+    #[tokio::test]
+    async fn queued_summary_reports_the_place_in_the_queue() {
+        let db = setup_queue_db().await;
+
+        let summary = db
+            .get_patchset_summary(20, None, None, false)
+            .await
+            .unwrap();
+        let summary = summary.unwrap();
+        assert_eq!(summary["priority"], 0);
+        assert_eq!(summary["queue_position"], 20);
+        assert_eq!(summary["queue_pending"], 24);
+
+        db.set_patchset_priority(20, 1).await.unwrap();
+        let summary = db
+            .get_patchset_summary(20, None, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["priority"], 1);
+        assert_eq!(summary["queue_position"], 1);
+
+        // Not queued, so there is no position to report -- and no stale one
+        // either.
+        let summary = db
+            .get_patchset_summary(25, None, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["queue_position"], serde_json::Value::Null);
+        assert_eq!(summary["queue_pending"], serde_json::Value::Null);
     }
 
     #[tokio::test]

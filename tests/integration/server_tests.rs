@@ -903,6 +903,230 @@ async fn test_token_lift_embargo_rejected_in_read_only_mode() {
     );
 }
 
+// ── Review queue priority ────────────────────────────────────────────────
+
+/// Seeds a review queue deep enough that the patchset acted on below is nowhere
+/// near the head of it. Ids and dates ascend together, so the natural order and
+/// the id order agree and a reordering is unmistakable.
+async fn seed_review_queue(db: &Arc<Database>, depth: i64) {
+    for id in 1..=depth {
+        let date = 1_780_000_000 + id * 60;
+        db.conn
+            .execute(
+                &format!(
+                    "INSERT INTO messages (message_id, subject, author, date) \
+                     VALUES ('q{id}@example.com', '[PATCH] queued {id}', \
+                             'Author <a@b.com>', {date})"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                &format!(
+                    "INSERT INTO patchsets \
+                       (id, status, subject, author, date, cover_letter_message_id) \
+                     VALUES ({id}, 'Pending', '[PATCH] queued {id}', 'Author <a@b.com>', \
+                             {date}, 'q{id}@example.com')"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn stored_priority(db: &Arc<Database>, id: i64) -> i64 {
+    let mut rows = db
+        .conn
+        .query(
+            "SELECT priority FROM patchsets WHERE id = ?",
+            libsql::params![id],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_lift_priority_moves_patchset_to_front_of_queue() {
+    let server = spawn_test_server(false).await;
+    seed_review_queue(&server.db, 30).await;
+
+    // A message-ID from the series rather than an id, which is what an operator
+    // reading the list has at hand.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority?id=q25@example.com",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "updated");
+    assert_eq!(body["id"], 25);
+    assert_eq!(body["priority"], 1);
+    assert_eq!(body["was_priority"], 0);
+    assert_eq!(body["queue_position"], 1);
+    assert_eq!(body["queue_pending"], 30);
+    assert_eq!(stored_priority(&server.db, 25).await, 1);
+
+    // The dispatch batch is what actually decides the review order, and the
+    // batch the reviewer loop reads is far shallower than this queue.
+    let head: Vec<i64> = server
+        .db
+        .get_pending_patchsets(5)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|patchset| patchset.id)
+        .collect();
+    assert_eq!(head, vec![25, 1, 2, 3, 4]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_priority_zero_returns_patchset_to_queue_order() {
+    let server = spawn_test_server(false).await;
+    seed_review_queue(&server.db, 30).await;
+
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{}/api/patchset/priority?id=25", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority?id=25&priority=0",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "updated");
+    assert_eq!(body["priority"], 0);
+    assert_eq!(body["was_priority"], 1);
+    assert_eq!(body["queue_position"], 25);
+    assert_eq!(stored_priority(&server.db, 25).await, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_priority_refused_for_patchset_not_in_the_queue() {
+    let server = spawn_test_server(false).await;
+    // Reviewed, so there is no wait left to shorten.
+    seed_embargoed_patchset(&server.db, None).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/patchset/priority?id=1", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "not_modified");
+    assert_eq!(body["patchset_status"], "Reviewed");
+    assert_eq!(stored_priority(&server.db, 1).await, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_priority_unknown_patchset_is_not_found() {
+    let server = spawn_test_server(false).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority?id=absent@example.com",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_priority_rejected_in_read_only_mode() {
+    let server = spawn_test_server(/* read_only */ true).await;
+    seed_review_queue(&server.db, 3).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/patchset/priority?id=3", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(stored_priority(&server.db, 3).await, 0);
+}
+
+/// The patchset page is where the position is rendered, so it has
+/// to come back with the patchset.
+#[tokio::test]
+#[ignore]
+async fn test_queued_patchset_summary_carries_its_queue_position() {
+    let server = spawn_test_server(false).await;
+    seed_review_queue(&server.db, 30).await;
+
+    let summary: serde_json::Value =
+        reqwest::get(format!("{}/api/patchset?id=25", server.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(summary["status"], "Pending");
+    assert_eq!(summary["priority"], 0);
+    assert_eq!(summary["queue_position"], 25);
+    assert_eq!(summary["queue_pending"], 30);
+
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{}/api/patchset/priority?id=25", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    let summary: serde_json::Value =
+        reqwest::get(format!("{}/api/patchset?id=25", server.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(summary["priority"], 1);
+    assert_eq!(summary["queue_position"], 1);
+
+    // And the list carries the marker, which is the only thing that tells a
+    // lifted row apart from the rest of the queue at a glance.
+    let list: serde_json::Value =
+        reqwest::get(format!("{}/api/patchsets?q=queued 25", server.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(list["items"][0]["id"], 25);
+    assert_eq!(list["items"][0]["priority"], 1);
+}
+
 // ── Redaction of cross-reviewed embargoed patchsets ──────────────────────
 
 /// Merges a peer's finding into the seeded patchset the way the reviewer does:

@@ -346,6 +346,35 @@ Optional array of additional git remotes to track.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
+#### Review queue priority
+
+Patchsets are reviewed oldest-first, `concurrency` at a time. A backlog of a
+hundred series is therefore a long wait for the last one in, which is a problem
+when one of them matters more than the rest. Any pending patchset can be marked
+high priority, which moves it to the front of the queue:
+
+```
+curl -X POST 'http://127.0.0.1:8080/api/patchset/priority?id=<key>'
+```
+
+`<key>` is a patchset id, slug, or the message-ID of the cover letter or of any
+patch in the series -- the same keys `/api/patch` takes. `&priority=0` puts the
+patchset back into ordinary date order, and a higher `priority` outranks a lower
+one; among equal priorities the order is still oldest-first. The response reports
+the patchset's new place in the queue.
+[`sashiko-cli priority`](sashiko-cli.md#priority) wraps the same endpoint.
+
+This reorders the queue and nothing else -- it is unrelated to lifting an
+embargo, which publishes findings early. No review already running is cancelled to
+make room, so a prioritized patchset starts when the next review slot frees up.
+Only a `Pending` patchset can be prioritized; anything already in review is past
+the point where the queue order decides anything.
+
+The marker is sticky, and survives a review that fails or that a restarted
+daemon returns to the queue -- a patchset that was urgent before the restart is
+still the urgent one after it. Clear it with `&priority=0` when it has served its
+purpose.
+
 ### `[semcode]`
 
 Optional. Gives the reviewing model semantic code-navigation tools

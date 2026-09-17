@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::db::{Database, EmbargoLift};
+use crate::db::{Database, EmbargoLift, PriorityChange};
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
 use axum::{
@@ -270,6 +270,21 @@ pub struct EmbargoLiftQuery {
 }
 
 #[derive(Deserialize)]
+pub struct PatchsetPriorityQuery {
+    /// Patchset id, slug, or message-ID, as accepted by `/api/patch`.
+    pub id: String,
+    /// New dispatch priority: higher is reviewed sooner, 0 is an ordinary place
+    /// in the queue. Defaults to lifting, so the UI's button needs no argument
+    /// and only clearing one has to be spelled out.
+    #[serde(default = "default_lift_priority")]
+    pub priority: i64,
+}
+
+fn default_lift_priority() -> i64 {
+    1
+}
+
+#[derive(Deserialize)]
 pub struct InjectRequest {
     pub raw: String,
     pub group: Option<String>,
@@ -400,6 +415,7 @@ pub fn build_router(
             "/api/patchset/embargo/lift-token",
             post(lift_patchset_embargo_token),
         )
+        .route("/api/patchset/priority", post(set_patchset_priority))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -1481,6 +1497,103 @@ async fn lift_embargo(
         // resolve_patchset_id found the row, so this is a delete racing the
         // lift rather than a bad key.
         EmbargoLift::NotFound => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Moves a pending patchset to the front of the review queue, or back into
+/// ordinary date order.
+///
+/// Localhost only, like the other write endpoints.
+async fn set_patchset_priority(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PatchsetPriorityQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    change_priority(&state, &query, "localhost").await
+}
+
+/// Writes the new priority, behind the priority endpoint.
+///
+/// Dispatch itself stays with the reviewer loop, which reads the queue in
+/// priority order on its next pass. So a lift reports the patchset's new place
+/// in the queue, not that a review has started: it starts when a review slot
+/// frees up, and nothing in flight is cancelled to make one.
+///
+/// `how` says which endpoint it came through, for the log only; the row records
+/// the priority and not who asked for it.
+async fn change_priority(
+    state: &AppState,
+    query: &PatchsetPriorityQuery,
+    how: &str,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let id = state
+        .db
+        .resolve_patchset_id(&query.id)
+        .await
+        .map_err(|e| {
+            error!("Failed to resolve patchset {}: {}", query.id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let outcome = state
+        .db
+        .set_patchset_priority(id, query.priority)
+        .await
+        .map_err(|e| {
+            error!("Failed to set priority for patchset {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    match outcome {
+        PriorityChange::Changed {
+            was,
+            now,
+            position,
+            pending,
+        } => {
+            info!(
+                "Priority for patchset {} set to {} (was {}) by {} request; now {} of {} pending",
+                id, now, was, how, position, pending
+            );
+            Ok(Json(serde_json::json!({
+                "status": "updated",
+                "id": id,
+                "priority": now,
+                "was_priority": was,
+                "queue_position": position,
+                "queue_pending": pending,
+            })))
+        }
+        PriorityChange::Unchanged {
+            priority,
+            position,
+            pending,
+        } => Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "id": id,
+            "priority": priority,
+            "queue_position": position,
+            "queue_pending": pending,
+            "reason": "Patchset already has this priority",
+        }))),
+        PriorityChange::NotPending { status } => Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "id": id,
+            "patchset_status": status,
+            "reason": "Patchset is not waiting for review, so it has no place in the queue",
+        }))),
+        // resolve_patchset_id found the row, so this is a delete racing the
+        // write rather than a bad key.
+        PriorityChange::NotFound => Err(StatusCode::NOT_FOUND),
     }
 }
 

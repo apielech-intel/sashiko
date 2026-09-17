@@ -167,6 +167,21 @@ enum Commands {
         /// Patchset ID, slug, or message-ID of the cover letter or any patch
         id: String,
     },
+    /// Mark a pending patchset high priority, reviewed ahead of the queue
+    ///
+    /// Unrelated to `lift-embargo`, which publishes findings early.
+    Priority {
+        /// Patchset ID, slug, or message-ID of the cover letter or any patch
+        id: String,
+
+        /// Return the patchset to ordinary oldest-first queue order
+        #[arg(long)]
+        clear: bool,
+
+        /// Priority level to set; higher is reviewed sooner (default 1)
+        #[arg(long, conflicts_with = "clear")]
+        level: Option<i64>,
+    },
     /// Run a local review (or queue to running server)
     Local {
         /// Git revision, range (e.g. HEAD~3..HEAD), or commit SHA
@@ -324,6 +339,10 @@ async fn run_command(
         Commands::Rerun { id } => handle_rerun(client, base_url, id, format).await,
         Commands::Cancel { id, force } => handle_cancel(client, base_url, id, force, format).await,
         Commands::LiftEmbargo { id } => handle_lift_embargo(client, base_url, id, format).await,
+        Commands::Priority { id, clear, level } => {
+            let priority = level.unwrap_or(if clear { 0 } else { 1 });
+            handle_priority(client, base_url, id, priority, format).await
+        }
         Commands::Local {
             input,
             baseline,
@@ -1420,14 +1439,13 @@ async fn handle_cancel(
     Ok(())
 }
 
-async fn handle_lift_embargo(
-    client: &Client,
-    base_url: &str,
-    id: String,
-    format: OutputFormat,
-) -> Result<()> {
-    // Message-IDs are accepted here, and their local part can carry characters
-    // that a query string reads as separators.
+/// Escapes a patchset key for the `?id=` of an endpoint that takes one.
+///
+/// Message-IDs are accepted as keys, and their local part can carry characters
+/// that a query string reads as separators. The angle brackets a message-ID is
+/// usually quoted in are dropped, since that is how it is copied out of a mail
+/// client and not part of the value.
+fn encode_patchset_key(id: &str) -> String {
     const QUERY_VALUE_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
         .add(b'&')
         .add(b'+')
@@ -1435,10 +1453,20 @@ async fn handle_lift_embargo(
         .add(b'#')
         .add(b' ')
         .add(b'%');
-    let key = percent_encoding::utf8_percent_encode(
+    percent_encoding::utf8_percent_encode(
         id.trim_matches(|c| c == '<' || c == '>'),
         QUERY_VALUE_ENCODE,
-    );
+    )
+    .to_string()
+}
+
+async fn handle_lift_embargo(
+    client: &Client,
+    base_url: &str,
+    id: String,
+    format: OutputFormat,
+) -> Result<()> {
+    let key = encode_patchset_key(&id);
     let url = format!("{}/api/patchset/embargo/lift?id={}", base_url, key);
     let resp = client.post(&url).send().await?;
 
@@ -1481,6 +1509,71 @@ async fn handle_lift_embargo(
         let text = resp.text().await.unwrap_or_default();
         return Err(anyhow::anyhow!(
             "Embargo lift failed ({}): {}",
+            status,
+            text
+        ));
+    }
+
+    Ok(())
+}
+
+/// Marks a pending patchset high priority, so it is reviewed ahead of the queue.
+///
+/// Nothing to do with [`handle_lift_embargo`], which publishes findings early.
+///
+/// Reports the new place in the queue rather than a started review: dispatch
+/// belongs to the reviewer loop, which picks the patchset up when a review slot
+/// frees up. Nothing already running is cancelled to make one.
+async fn handle_priority(
+    client: &Client,
+    base_url: &str,
+    id: String,
+    priority: i64,
+    format: OutputFormat,
+) -> Result<()> {
+    let key = encode_patchset_key(&id);
+    let url = format!(
+        "{}/api/patchset/priority?id={}&priority={}",
+        base_url, key, priority
+    );
+    let resp = client.post(&url).send().await?;
+
+    if resp.status().is_success() {
+        let result: serde_json::Value = resp.json().await?;
+        match format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            OutputFormat::Text => {
+                let patchset = result["id"].as_i64().unwrap_or_default();
+                if result["status"].as_str() == Some("updated") {
+                    let position = result["queue_position"].as_i64().unwrap_or_default();
+                    let pending = result["queue_pending"].as_i64().unwrap_or_default();
+                    if priority > 0 {
+                        print_colored(Color::Green, "High priority: ");
+                    } else {
+                        print_colored(Color::Green, "Normal priority: ");
+                    }
+                    println!(
+                        "Patchset {} is {} of {} waiting; it starts when a review slot frees up.",
+                        patchset, position, pending
+                    );
+                } else {
+                    print_colored(Color::Yellow, "Not modified: ");
+                    println!(
+                        "{}",
+                        result["reason"]
+                            .as_str()
+                            .unwrap_or("Queue order could not be changed.")
+                    );
+                }
+            }
+        }
+    } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("No patchset matches '{}'", id));
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Priority change failed ({}): {}",
             status,
             text
         ));

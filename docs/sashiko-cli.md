@@ -235,7 +235,10 @@ that fails or that a restarted daemon returns to the queue, so clear it with
 
 It requires the same access as `cancel` and `rerun`: the request must come from
 loopback, unless the daemon was started with `--enable-unsafe-all-submit`, and a
-read-only daemon refuses it outright.
+read-only daemon refuses it outright. A holder of an
+[embargo bypass token](configuration.md#server) can do the same from a browser,
+through the "High priority" button on the queue banner of a pending patchset --
+a different button from the embargo banner's "Lift now".
 
 ### local
 

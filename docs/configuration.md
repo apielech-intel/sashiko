@@ -297,18 +297,24 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `host` | string | `"127.0.0.1"` | Listen address. The shipped default is IPv4 loopback, because the API has no TLS of its own and passes embargo bypass tokens as bearer headers or a `?token=` query parameter, so it belongs behind a reverse proxy. Use `"::"` to bind every interface (IPv4 and IPv6), or `"0.0.0.0"` for IPv4 only -- the container image already sets the latter via `SASHIKO__SERVER__HOST`. A proxy on the same host should name its upstream `127.0.0.1:8080` rather than `localhost:8080`, which may resolve to `::1` first and find nothing listening. |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
-| `embargo_bypass_tokens` | list | `[]` | Secret tokens that let a client see embargoed findings and lift an embargo. Several may be active at once, so one can be rotated in before the old one is dropped. |
+| `embargo_bypass_tokens` | list | `[]` | Secret tokens that let a client see embargoed findings, lift an embargo, and reorder the review queue. Several may be active at once, so one can be rotated in before the old one is dropped. |
 
 A token is presented as `Authorization: Bearer <token>` or as `?token=<token>`;
 the web UI stores one from the latter and sends it as the former from then on.
-Holding it does two things: embargoed patchsets render in full instead of
-redacted, and `POST /api/patchset/embargo/lift-token?id=<key>` lifts an embargo
-(which is what the UI's "Lift now" button calls). That is a second endpoint
-rather than a widening of the first: `/api/patchset/embargo/lift`, the one
-[`sashiko-cli lift-embargo`](sashiko-cli.md#lift-embargo) uses, stays reachable
-only from loopback and accepts no token, so a deployment that configures one
-does not thereby expose the CLI's route to the network. Both are refused
-outright by a `read_only` daemon.
+Holding it does three things: embargoed patchsets render in full instead of
+redacted, `POST /api/patchset/embargo/lift-token?id=<key>` lifts an embargo
+(which is what the UI's "Lift now" button on the embargo banner calls), and
+`POST /api/patchset/priority-token?id=<key>&priority=<n>` reorders the
+[review queue](#review-queue-priority). Each is a second endpoint rather than a
+widening of the first: `/api/patchset/embargo/lift`, the one
+[`sashiko-cli lift-embargo`](sashiko-cli.md#lift-embargo) uses, and
+`/api/patchset/priority` stay reachable only from loopback and accept no token,
+so a deployment that configures one does not thereby expose the loopback routes
+to the network. All are refused outright by a `read_only` daemon.
+
+Note that the token is one credential for all three: a token handed out so
+somebody can read embargoed findings also lets them lift an embargo and reorder
+the queue.
 
 Tokens are secrets in a system with no TLS of its own: serve the API behind a
 reverse proxy, and remember that a token in a query string reaches the proxy's
@@ -374,6 +380,15 @@ The marker is sticky, and survives a review that fails or that a restarted
 daemon returns to the queue -- a patchset that was urgent before the restart is
 still the urgent one after it. Clear it with `&priority=0` when it has served its
 purpose.
+
+The web UI exposes this as a "High priority" button on the queue banner of a
+pending patchset (and "Clear high priority" once set), and marks prioritized rows
+in the patchset list with a ⏫. Note that this is not the embargo banner's "Lift
+now": embargo is set at ingest, so a pending patchset can show both banners, and
+the two buttons have nothing to do with each other. The button calls
+`POST /api/patchset/priority-token?id=<key>&priority=<n>`, which is the same
+operation authorized by an [embargo bypass token](#server) instead of by
+loopback, for the reason the embargo lift has two routes.
 
 ### `[semcode]`
 

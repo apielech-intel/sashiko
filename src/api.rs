@@ -416,6 +416,10 @@ pub fn build_router(
             post(lift_patchset_embargo_token),
         )
         .route("/api/patchset/priority", post(set_patchset_priority))
+        .route(
+            "/api/patchset/priority-token",
+            post(set_patchset_priority_token),
+        )
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -1503,7 +1507,8 @@ async fn lift_embargo(
 /// Moves a pending patchset to the front of the review queue, or back into
 /// ordinary date order.
 ///
-/// Localhost only, like the other write endpoints.
+/// Localhost only, like the other write endpoints. `set_patchset_priority_token`
+/// is the same operation for a client that authorizes with a token instead.
 async fn set_patchset_priority(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -1520,7 +1525,38 @@ async fn set_patchset_priority(
     change_priority(&state, &query, "localhost").await
 }
 
-/// Writes the new priority, behind the priority endpoint.
+/// Reorders the review queue on the strength of an embargo-bypass token.
+///
+/// Split from the loopback route for the reason
+/// [`lift_patchset_embargo_token`] is: the web UI reaches the API through a
+/// reverse proxy, so every request it makes already looks like localhost and
+/// accepting the token on the CLI's route would open that route to the network
+/// for every deployment that configures one.
+///
+/// The token is the same one, so a deployment that hands one out for reading
+/// embargoed findings also hands out the queue order. That is already true of
+/// the embargo lift, which is a write on the same credential.
+async fn set_patchset_priority_token(
+    BypassEmbargo(authorized): BypassEmbargo,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PatchsetPriorityQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !authorized {
+        info!(
+            "Refused token priority change for {}: no configured token presented",
+            query.id
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    change_priority(&state, &query, "token").await
+}
+
+/// Writes the new priority, behind both priority endpoints.
 ///
 /// Dispatch itself stays with the reviewer loop, which reads the queue in
 /// priority order on its next pass. So a lift reports the patchset's new place

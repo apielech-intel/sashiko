@@ -1077,7 +1077,116 @@ async fn test_priority_rejected_in_read_only_mode() {
     assert_eq!(stored_priority(&server.db, 3).await, 0);
 }
 
-/// The patchset page is where the position is rendered, so it has
+#[tokio::test]
+#[ignore]
+async fn test_token_priority_with_bearer_token() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 30).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority-token?id=25",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "updated");
+    assert_eq!(body["queue_position"], 1);
+    assert_eq!(stored_priority(&server.db, 25).await, 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_priority_without_token_is_unauthorized() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 3).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority-token?id=3",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(stored_priority(&server.db, 3).await, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_priority_with_wrong_token_is_unauthorized() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 3).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority-token?id=3",
+            server.base_url
+        ))
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(stored_priority(&server.db, 3).await, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_priority_unauthorized_when_no_tokens_configured() {
+    // Nothing to authorize against, so the route refuses everyone rather than
+    // letting a request past for want of anything to compare it with.
+    let server = spawn_test_server_with_tokens(false, &[]).await;
+    seed_review_queue(&server.db, 3).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority-token?id=3",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(stored_priority(&server.db, 3).await, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_priority_rejected_in_read_only_mode() {
+    let server = spawn_test_server_with_tokens(/* read_only */ true, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 3).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/priority-token?id=3",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(stored_priority(&server.db, 3).await, 0);
+}
+
+/// The patchset page is where the button lives, so the position it renders has
 /// to come back with the patchset.
 #[tokio::test]
 #[ignore]

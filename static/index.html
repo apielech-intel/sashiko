@@ -2574,6 +2574,13 @@
                     if (statusLabel === 'Reviewed' && p.cross_review_status === 'complete') {
                         statusLabel = 'Cross-reviewed';
                     }
+                    // Only while the patchset is still queued: the priority is
+                    // sticky, so a reviewed row can carry a flag that no longer
+                    // decides anything, and marking it would read as a claim
+                    // about the review rather than about the wait.
+                    const priorityMark = (statusLabel === 'Pending' && (p.priority || 0) > 0)
+                        ? ` <span title="High priority: reviewed ahead of the rest of the queue" style="color:var(--status-pending);">⏫</span>`
+                        : '';
                     let findingsHtml = '-';
                     if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
                         const counts = {
@@ -2598,7 +2605,7 @@
                         <td style="line-height:1.2;">${authorHtml}</td>
                         <td style="line-height:1.2;">${dateHtml}</td>
                         <td>${parts}</td>
-                        <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
+                        <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span>${priorityMark}</td>
                         <td>${findingsHtml}</td>
                     `;
                 } else {
@@ -2779,6 +2786,92 @@
                 say(`Embargo lifted. The patchset is ${body.patchset_status || 'not reviewed yet'}, `
                     + 'so the release waits for the review to finish.', '--status-embargoed');
             }
+        }
+
+        // Behind the queue banner's "High priority" / "Clear high priority"
+        // buttons, wired to the token-authorized priority endpoint for the same
+        // reason liftEmbargoNow uses the token one: the other route is the CLI's
+        // and is localhost-only, and a browser arrives through the reverse proxy.
+        //
+        // Deliberately not labelled "Lift now" like the embargo button: embargo is
+        // set at ingest, so a pending patchset renders both banners at once, and
+        // the two actions have nothing to do with each other. This one also sets a
+        // lasting marker rather than doing something on the spot.
+        //
+        // Dispatch belongs to the reviewer loop, which re-reads the queue in
+        // priority order on its next pass. So what this reports is the patchset's
+        // new place in the queue, not that a review has started -- that waits for
+        // a review slot, and no review already running is cancelled to free one.
+        async function setQueuePriority(patchsetId, priority, btn) {
+            const lifting = priority > 0;
+            const question = lifting
+                ? 'Mark this patchset high priority, ahead of everything else queued?'
+                : 'Return this patchset to ordinary queue order?';
+            if (!confirm(question)) return;
+
+            const note = document.getElementById('queuePriorityNote');
+            const say = (msg, color) => {
+                if (!note) return;
+                note.style.display = 'block';
+                note.style.color = `var(${color})`;
+                note.textContent = msg;
+            };
+
+            btn.disabled = true;
+            say(lifting ? 'Marking…' : 'Clearing…', '--text-dim');
+
+            let res;
+            try {
+                res = await apiFetch(
+                    `api/patchset/priority-token?id=${encodeURIComponent(patchsetId)}`
+                    + `&priority=${priority}`,
+                    { method: 'POST' });
+            } catch (e) {
+                btn.disabled = false;
+                say(`Request failed: ${e.message}`, '--error-title');
+                return;
+            }
+
+            if (!res.ok) {
+                btn.disabled = false;
+                // Told apart because they need different things done about them:
+                // a token this server does not know, versus an instance that
+                // takes no writes at all.
+                if (res.status === 401) {
+                    say('Refused: this server does not accept the bypass token stored in this browser.', '--error-title');
+                } else if (res.status === 403) {
+                    say('Refused: this instance is read-only.', '--error-title');
+                } else {
+                    say(`Failed: ${res.status} ${res.statusText}`, '--error-title');
+                }
+                return;
+            }
+
+            const body = await res.json().catch(() => ({}));
+            if (body.status !== 'updated') {
+                say(body.reason || 'Queue order unchanged.', '--text-dim');
+                // A patchset the reviewer loop claimed while the banner was on
+                // screen is no longer queued at all, so the banner is stale.
+                if (body.patchset_status) setTimeout(() => router(), 1500);
+                return;
+            }
+
+            const place = body.queue_position
+                ? ` It is now ${ordinal(body.queue_position)} of ${body.queue_pending} waiting.`
+                : '';
+            say((lifting
+                    ? 'Marked high priority.'
+                    : 'Returned to ordinary queue order.')
+                + place
+                + ' The review starts when a slot frees up.', '--status-pending');
+            // Re-render so the banner and the badge agree with what was written.
+            setTimeout(() => router(), 1500);
+        }
+
+        function ordinal(n) {
+            const rest = n % 100;
+            if (rest >= 11 && rest <= 13) return `${n}th`;
+            return `${n}${['th', 'st', 'nd', 'rd'][n % 10] || 'th'}`;
         }
 
         async function renderPatchsetView(id, query = {}) {
@@ -3065,6 +3158,38 @@
                 `;
             }
 
+            // Queue banner, for a patchset still waiting for review. Its place in
+            // the queue is the thing an operator watching a 100-deep backlog wants
+            // to know, and the button that changes it belongs next to the number.
+            //
+            // Only for `Pending`: the endpoint refuses everything else, and a
+            // control that can only collect a refusal is worse than no control.
+            let queueHtml = '';
+            if (data.status === 'Pending') {
+                const lifted = (data.priority || 0) > 0;
+                const place = data.queue_position
+                    ? `${ordinal(data.queue_position)} of ${data.queue_pending} waiting for review`
+                    : 'waiting for review';
+                // Offered only to a browser holding a bypass token, which is what
+                // authorizes the endpoint. Numeric id only, for the reason the
+                // embargo button takes one: it goes into an onclick attribute.
+                const canLift = getBypassToken() && Number.isInteger(data.id);
+                const buttonHtml = !canLift ? ''
+                    : lifted
+                        ? `<button onclick="setQueuePriority(${data.id}, 0, this)" title="Return this patchset to ordinary oldest-first queue order">Clear high priority</button>`
+                        : `<button onclick="setQueuePriority(${data.id}, 1, this)" title="Review this patchset ahead of everything else waiting">High priority</button>`;
+                queueHtml = `
+                    <div class="section" style="margin-bottom:16px; border-left:4px solid var(--status-pending);">
+                        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                            <h3 style="margin:0; color:var(--status-pending);">${lifted ? '⏫ High priority' : `⏳ Queued — ${place}`}</h3>
+                            ${buttonHtml}
+                        </div>
+                        ${lifted ? `<div style="margin-top:8px; font-size:0.9em; color:var(--text-dim);">${place}; the review starts when a slot frees up.</div>` : ''}
+                        <div id="queuePriorityNote" style="display:none; margin-top:8px; font-size:0.9em;"></div>
+                    </div>
+                `;
+            }
+
             const modelName = data.model_name || '-';
             const providerModel = data.provider ? `${data.provider}/${modelName}` : modelName;
             const promptsHash = data.prompts_git_hash ? data.prompts_git_hash.substring(0, 8) : '-';
@@ -3165,6 +3290,7 @@
                 
                 ${failureHtml}
                 ${embargoHtml}
+                ${queueHtml}
 
                 <div class="section kv-columns">
                     <div class="kv-col-main">

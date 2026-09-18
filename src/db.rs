@@ -4377,6 +4377,81 @@ impl Database {
         }
     }
 
+    /// Move one patchset's patches, reviews and subsystems onto another and
+    /// drop the emptied row.
+    ///
+    /// Both places that can end up with two rows for one series use this: the
+    /// author/thread scan, which folds together look-alikes it finds in one
+    /// pass, and the cover-letter match, which folds in the placeholder a
+    /// thread submit left behind under a member's message-id.
+    ///
+    /// Cross-review jobs are not moved, and their foreign key means a source
+    /// that owns one cannot be dropped -- by then the patches and reviews have
+    /// moved, so the caller gets the error with the fold half done.  That is
+    /// the author/thread scan's corner and always has been: a job is enqueued
+    /// when a review is dispatched, which is long after a placeholder has left
+    /// Fetching behind, so the row this folds in cannot own one.
+    async fn absorb_patchset(&self, merge_from_id: i64, target_id: i64) -> Result<()> {
+        if merge_from_id == target_id {
+            return Ok(());
+        }
+        info!("Merging patchset {} into {}", merge_from_id, target_id);
+
+        // Reassign patches
+        self.conn
+            .execute(
+                "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
+                libsql::params![target_id, merge_from_id],
+            )
+            .await?;
+
+        // received_parts is a stored count of those, and whether a series reads
+        // as complete is derived from it, so patches that moved without being
+        // recounted are a series that stays Incomplete however many parts it
+        // has.  Recounted here rather than left to the caller: the author/thread
+        // scan recounts after its own updates, but the cover-letter fold goes
+        // straight on to decide the status from this column.
+        self.conn
+            .execute(
+                "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
+                libsql::params![target_id, target_id],
+            )
+            .await?;
+
+        // Reassign reviews
+        self.conn
+            .execute(
+                "UPDATE reviews SET patchset_id = ? WHERE patchset_id = ?",
+                libsql::params![target_id, merge_from_id],
+            )
+            .await?;
+
+        // Merge subsystems
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id)
+                         SELECT ?, subsystem_id FROM patchsets_subsystems WHERE patchset_id = ?",
+                libsql::params![target_id, merge_from_id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
+                libsql::params![merge_from_id],
+            )
+            .await?;
+
+        // Delete the merged patchset
+        self.conn
+            .execute(
+                "DELETE FROM patchsets WHERE id = ?",
+                libsql::params![merge_from_id],
+            )
+            .await?;
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_patchset(
         &self,
@@ -4415,6 +4490,25 @@ impl Database {
             clid_candidates.push(message_id.to_string());
         }
 
+        #[derive(Clone, Copy)]
+        struct ClidMatch {
+            id: i64,
+            is_placeholder: bool,
+            subject_index: u32,
+            existing_total: u32,
+        }
+
+        // Score every candidate before picking one.  Taking the first hit was
+        // enough while at most one could match, but a thread whose root is a real
+        // message -- a pull request, or a cover letter sent in its own send-email
+        // run, neither of which patchwork files with the series -- has two: the
+        // live patchset under that root, and the placeholder created under the
+        // member message-id whoever submitted the thread happened to name.  The
+        // root is tried first, so the live row won and returned, leaving the
+        // placeholder owning a message-id of this series.  Every later lookup by
+        // that id then answered with an empty row parked in Fetching instead of
+        // with the review.
+        let mut clid_matches: Vec<ClidMatch> = Vec::new();
         for clid in clid_candidates {
             let mut rows = self
                 .conn
@@ -4425,6 +4519,10 @@ impl Database {
                 .await?;
             while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
+                // Two candidates can name the same row; score it once.
+                if clid_matches.iter().any(|m| m.id == id) {
+                    continue;
+                }
                 let existing_subject: String = row.get(3)?;
                 let existing_status: String = row.get(6).unwrap_or_else(|_| "Unknown".to_string());
 
@@ -4453,64 +4551,99 @@ impl Database {
                     continue;
                 }
 
-                // Found it! Use this ID. We'll update its fields below.
-                let subject_index: u32 = row.get(4).unwrap_or(9999);
-                let existing_total: u32 = row.get(5).unwrap_or(1);
-
-                // Prevent downgrading a series to a singleton if we already have multiple parts.
-                // This handles cases where a singleton root (1/1) overwrites a series (N/N) inferred from replies.
-                let final_total = if total_parts == 1 && existing_total > 1 {
-                    existing_total
-                } else {
-                    total_parts
-                };
-
-                // We proceed to update this record with the full metadata
-                self.conn.execute(
-                    "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                    libsql::params![thread_id, author, final_total, parser_version, to, cc, id],
-                ).await?;
-
-                if let Some(real_clid) = cover_letter_message_id {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
-                            libsql::params![real_clid, id],
-                        )
-                        .await?;
-                }
-
-                if let Some(bid) = baseline_id {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET baseline_id = ? WHERE id = ?",
-                            libsql::params![bid, id],
-                        )
-                        .await?;
-                }
-
-                // Update subject if this is a better index (e.g. going from placeholder to real subject)
-                if part_index < subject_index {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                            libsql::params![subject, part_index, id],
-                        )
-                        .await?;
-                }
-
-                self.conn.execute(
-                    "UPDATE patchsets SET status = 'Incomplete' WHERE id = ? AND status = 'Fetching'",
-                    libsql::params![id],
-                ).await?;
-
-                self.conn.execute(
-                    "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-                    libsql::params![id],
-                ).await?;
-
-                return Ok(Some(id));
+                clid_matches.push(ClidMatch {
+                    id,
+                    is_placeholder,
+                    subject_index: row.get(4).unwrap_or(9999),
+                    existing_total: row.get(5).unwrap_or(1),
+                });
             }
+        }
+
+        // A row that already holds the series outranks a placeholder, whichever
+        // candidate turned it up.  Rotate rather than swap, so that among rows of
+        // equal standing the earlier candidate still wins, as it always has.
+        if let Some(live) = clid_matches.iter().position(|m| !m.is_placeholder) {
+            let target = clid_matches.remove(live);
+            clid_matches.insert(0, target);
+        }
+
+        if let Some(target) = clid_matches.first().copied() {
+            // Found it! Use this ID. We'll update its fields below.
+            let id = target.id;
+            let subject_index = target.subject_index;
+            let existing_total = target.existing_total;
+
+            // The other placeholders hold nothing, but they do own message-ids of
+            // this series, and leaving one behind is what stranded reviews.  Fold
+            // them in.  What the submit request put on them -- filters, slug, mr_*
+            // -- is not carried over: only a thread submit can key a placeholder
+            // on a message that is not the thread root, and that path sets none of
+            // it, while a git import matches the sha@sashiko.local candidate above
+            // and is its own target.
+            let strays: Vec<i64> = clid_matches
+                .iter()
+                .skip(1)
+                .filter(|m| m.is_placeholder)
+                .map(|m| m.id)
+                .collect();
+            for stray_id in strays {
+                self.absorb_patchset(stray_id, id).await?;
+            }
+
+            // Prevent downgrading a series to a singleton if we already have multiple parts.
+            // This handles cases where a singleton root (1/1) overwrites a series (N/N) inferred from replies.
+            let final_total = if total_parts == 1 && existing_total > 1 {
+                existing_total
+            } else {
+                total_parts
+            };
+
+            // We proceed to update this record with the full metadata
+            self.conn.execute(
+                "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
+                libsql::params![thread_id, author, final_total, parser_version, to, cc, id],
+            ).await?;
+
+            if let Some(real_clid) = cover_letter_message_id {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                        libsql::params![real_clid, id],
+                    )
+                    .await?;
+            }
+
+            if let Some(bid) = baseline_id {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET baseline_id = ? WHERE id = ?",
+                        libsql::params![bid, id],
+                    )
+                    .await?;
+            }
+
+            // Update subject if this is a better index (e.g. going from placeholder to real subject)
+            if part_index < subject_index {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                        libsql::params![subject, part_index, id],
+                    )
+                    .await?;
+            }
+
+            self.conn.execute(
+                "UPDATE patchsets SET status = 'Incomplete' WHERE id = ? AND status = 'Fetching'",
+                libsql::params![id],
+            ).await?;
+
+            self.conn.execute(
+                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                libsql::params![id],
+            ).await?;
+
+            return Ok(Some(id));
         }
 
         // 2. Normal matching logic: Find candidate patchsets in this thread OR matching author/time
@@ -4704,52 +4837,12 @@ impl Database {
 
             // If we have multiple matches, merge others into target_id
             for (merge_from_id, merge_subject_index) in matches.iter().skip(1) {
-                let merge_from_id = *merge_from_id;
-                info!("Merging patchset {} into {}", merge_from_id, target_id);
-
-                // Reassign patches
-                self.conn
-                    .execute(
-                        "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
-                        libsql::params![target_id, merge_from_id],
-                    )
-                    .await?;
-
-                // Reassign reviews
-                self.conn
-                    .execute(
-                        "UPDATE reviews SET patchset_id = ? WHERE patchset_id = ?",
-                        libsql::params![target_id, merge_from_id],
-                    )
-                    .await?;
-
-                // Merge subsystems
-                self.conn
-                    .execute(
-                        "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id)
-                         SELECT ?, subsystem_id FROM patchsets_subsystems WHERE patchset_id = ?",
-                        libsql::params![target_id, merge_from_id],
-                    )
-                    .await?;
-                self.conn
-                    .execute(
-                        "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
-                        libsql::params![merge_from_id],
-                    )
-                    .await?;
+                self.absorb_patchset(*merge_from_id, target_id).await?;
 
                 // If the merged patchset had a better subject index, track it
                 if *merge_subject_index < current_subject_index {
                     current_subject_index = *merge_subject_index;
                 }
-
-                // Delete the merged patchset
-                self.conn
-                    .execute(
-                        "DELETE FROM patchsets WHERE id = ?",
-                        libsql::params![merge_from_id],
-                    )
-                    .await?;
             }
 
             // Update the target patchset
@@ -8087,6 +8180,295 @@ mod tests {
             .unwrap();
         let n: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(n, 1, "series must not split into multiple patchsets");
+    }
+
+    /// A pull request is a real thread root that patchwork files outside the
+    /// series, so the poller submits 1/N and the thread fetch puts the series
+    /// under the root instead. The placeholder left under 1/N has to be folded
+    /// in: while it survives it owns 1/N's message-id, and the poller polling
+    /// that id gets an empty row stuck in Fetching rather than the review.
+    #[tokio::test]
+    async fn placeholder_under_first_patch_folds_into_root_patchset() {
+        let db = setup_db().await;
+        let author = "\"Pull Requester\" <pr@example.com>";
+
+        // What the submit created: patchwork's series has no cover letter, so the
+        // poller named 1/2 and the placeholder is keyed on 1/2's message-id.
+        let placeholder = db
+            .create_fetching_patchset(
+                "pr-2@example.com",
+                "Fetching thread pr-2@example.com...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let thread_id = db
+            .ensure_thread_for_message("pr-2@example.com", 1000)
+            .await
+            .unwrap();
+
+        // The fetch pulls the whole thread, root first. The root is the pull
+        // request, and it lands as a cover letter under its own message-id --
+        // a live patchset that is not the one the placeholder is keyed on.
+        db.create_message(
+            "pr-1@example.com",
+            thread_id,
+            None,
+            author,
+            "[PATCH 0/2] pull request",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let root_ps = db
+            .create_patchset(
+                thread_id,
+                Some("pr-1@example.com"),
+                "pr-1@example.com",
+                "[PATCH 0/2] pull request",
+                author,
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the root must land");
+        assert_ne!(
+            root_ps, placeholder,
+            "the root is keyed on its own message-id, not the submitted one"
+        );
+
+        // Then 1/2, whose own message-id is the one the placeholder holds. Both
+        // rows match, and the live one has to win.
+        db.create_message(
+            "pr-2@example.com",
+            thread_id,
+            Some("pr-1@example.com"),
+            author,
+            "[PATCH 1/2] first",
+            1001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                thread_id,
+                Some("pr-1@example.com"),
+                "pr-2@example.com",
+                "[PATCH 1/2] first",
+                author,
+                1001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("1/2 must resolve");
+        assert_eq!(
+            ps1, root_ps,
+            "1/2 belongs to the root's patchset, not to the placeholder"
+        );
+        db.create_patch(ps1, "pr-2@example.com", 1, "diff --git a/a b/a\n")
+            .await
+            .unwrap();
+
+        // The placeholder is folded away rather than left owning 1/2.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE id = ?",
+                libsql::params![placeholder],
+            )
+            .await
+            .unwrap();
+        let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 0, "the placeholder must not outlive the fold");
+
+        // So the message-id the poller polls now answers with the real patchset,
+        // by way of the patch fallback.
+        let details = db
+            .get_patchset_details_by_msgid("pr-2@example.com", None, None, true)
+            .await
+            .unwrap()
+            .expect("1/2 must resolve to a patchset");
+        assert_eq!(
+            details.get("id").and_then(|v| v.as_i64()),
+            Some(root_ps),
+            "a lookup by 1/2 must reach the patchset that holds the review"
+        );
+    }
+
+    /// The row a fold takes in is not always empty: asking for a patchset whose
+    /// review failed a second time puts one that already owns patches back into
+    /// Fetching. received_parts is a stored count, and the status the dispatcher
+    /// waits on is derived from it, so the fold has to recount -- left short, a
+    /// series that has every part still reads as Incomplete.
+    #[tokio::test]
+    async fn folded_placeholder_hands_its_patches_to_the_target() {
+        let db = setup_db().await;
+        let author = "\"Pull Requester\" <pr@example.com>";
+
+        let thread_id = db
+            .ensure_thread_for_message("pr-1@example.com", 1000)
+            .await
+            .unwrap();
+        for (msgid, in_reply_to, subject, date) in [
+            ("pr-1@example.com", None, "[PATCH 0/2] pull request", 1000),
+            (
+                "pr-2@example.com",
+                Some("pr-1@example.com"),
+                "[PATCH 1/2] first",
+                1001,
+            ),
+        ] {
+            db.create_message(
+                msgid,
+                thread_id,
+                in_reply_to,
+                author,
+                subject,
+                date,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The live row under the true thread root, holding nothing yet.
+        let root_ps = db
+            .create_patchset(
+                thread_id,
+                Some("pr-1@example.com"),
+                "pr-1@example.com",
+                "[PATCH 0/2] pull request",
+                author,
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the root must land");
+
+        // The row the submit is keyed on, owning 1/2 and still in Fetching.
+        let placeholder = db
+            .create_fetching_patchset(
+                "pr-2@example.com",
+                "Fetching thread pr-2@example.com...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.create_patch(placeholder, "pr-2@example.com", 1, "diff --git a/a b/a\n")
+            .await
+            .unwrap();
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![placeholder],
+            )
+            .await
+            .unwrap();
+        let status: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            status, "Fetching",
+            "the fold only reaches rows the status still calls a placeholder"
+        );
+
+        let ps1 = db
+            .create_patchset(
+                thread_id,
+                Some("pr-1@example.com"),
+                "pr-2@example.com",
+                "[PATCH 1/2] first",
+                author,
+                1001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("1/2 must resolve");
+        assert_eq!(ps1, root_ps, "the live row wins the fold");
+
+        // Asserted before the caller records the patch of its own, so the count
+        // is the fold's work and not create_patch's.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT (SELECT COUNT(*) FROM patchsets WHERE id = ?),
+                        (SELECT COUNT(*) FROM patches WHERE patchset_id = ?),
+                        (SELECT received_parts FROM patchsets WHERE id = ?)",
+                libsql::params![placeholder, root_ps, root_ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let husks: i64 = row.get(0).unwrap();
+        let patches: i64 = row.get(1).unwrap();
+        let received: u32 = row.get(2).unwrap();
+
+        assert_eq!(husks, 0, "the folded row is dropped");
+        assert_eq!(patches, 1, "its patch moved to the target");
+        assert_eq!(received, 1, "and the target's stored count moved with it");
     }
 
     /// A patch whose cover-letter candidates miss the placeholder falls through

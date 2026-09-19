@@ -169,6 +169,27 @@ pub enum EmbargoLift {
     NotFound,
 }
 
+/// Outcome of an external agent claiming the right to report a patchset.
+///
+/// The refusal carries the holder, because the only useful thing a connector
+/// that lost the race can log is who beat it to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportClaim {
+    /// The caller owns the report: it either just took the claim or already
+    /// held it from an earlier pass.
+    Ours {
+        /// When the claim was first taken, which is not `now` for a re-claim.
+        since: i64,
+    },
+    /// Another agent owns it. The caller must not mail the review, and must not
+    /// lift the embargo -- that would publish on the owner's behalf.
+    Held {
+        agent: String,
+        since: Option<i64>,
+    },
+    NotFound,
+}
+
 /// Outcome of a manual change to a patchset's dispatch priority, with the
 /// refusals kept apart the way [`EmbargoLift`]'s are so the caller can say
 /// which one it hit.
@@ -919,6 +940,12 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("patchsets", "embargo_release_started_at", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "reported_by", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "reported_at", "INTEGER")
             .await;
         let _ = self
             .try_add_column(
@@ -6443,6 +6470,98 @@ impl Database {
         Ok(())
     }
 
+    /// Claims the right to report a patchset's review outside sashiko: to mail
+    /// it, and to publish it early by lifting the embargo.
+    ///
+    /// One patchset gets one reporting agent. A review here is keyed on the
+    /// cover letter's message-id, but the patchwork instances that carry the
+    /// series are not: a series cross-posted to two lists is one patchset and
+    /// two patchwork series, so two connectors submit the same message-id, get
+    /// the same review back, and -- without this -- mail it twice to an
+    /// overlapping set of people. The embargo is worse than the mail, because it
+    /// belongs to the patchset and not to either connector: whichever one lifts
+    /// it publishes the findings for both, cutting short a hold the other one
+    /// was still counting down.
+    ///
+    /// Idempotent for the same `agent`, which is what makes it safe to call on
+    /// every pass and after a restart: a connector that claimed, died and came
+    /// back still owns what it claimed. `reported_at` keeps the first claim's
+    /// time for the same reason -- it says when the patchset was spoken for, not
+    /// when it was last asked about.
+    ///
+    /// No lease, unlike [`Self::claim_patchset_embargo_release`]. That one
+    /// guards work sashiko retries, so a claim left behind by a crash has to
+    /// expire; this one guards a mail that cannot be recalled. An agent that
+    /// claims and then dies for good leaves the review unmailed, which is the
+    /// side to fail on.
+    pub async fn claim_patchset_report(
+        &self,
+        id: i64,
+        agent: &str,
+        now: i64,
+    ) -> Result<ReportClaim> {
+        // Read first, so a patchset sashiko has never heard of is
+        // distinguishable from one that is spoken for -- the UPDATE alone
+        // reports both as "not yours". The UPDATE stays guarded, so two agents
+        // racing through here still leave exactly one owner.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT reported_by, reported_at FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(ReportClaim::NotFound);
+        };
+        let owner = row.get::<Option<String>>(0).ok().flatten();
+        let since = row.get::<Option<i64>>(1).ok().flatten();
+        if let Some(owner) = owner
+            && owner != agent
+        {
+            return Ok(ReportClaim::Held {
+                agent: owner,
+                since,
+            });
+        }
+
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE patchsets
+                 SET reported_by = ?, reported_at = COALESCE(reported_at, ?)
+                 WHERE id = ? AND (reported_by IS NULL OR reported_by = ?)",
+                libsql::params![agent, now, id, agent],
+            )
+            .await?;
+        if updated == 1 {
+            return Ok(ReportClaim::Ours {
+                since: since.unwrap_or(now),
+            });
+        }
+
+        // Somebody claimed it between the read and the UPDATE. Re-read rather
+        // than reporting a bare failure, so the loser still logs the winner.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT reported_by, reported_at FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(ReportClaim::Held {
+                agent: row
+                    .get::<Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                since: row.get::<Option<i64>>(1).ok().flatten(),
+            }),
+            None => Ok(ReportClaim::NotFound),
+        }
+    }
+
     /// Embargoed patchsets whose release time the dynamic schedule may still
     /// revise.
     ///
@@ -9691,6 +9810,134 @@ mod tests {
             .map(|patchset| patchset.id)
             .collect();
         assert!(!releasable.contains(&4));
+    }
+
+    async fn report_columns(db: &Arc<Database>, id: i64) -> (Option<String>, Option<i64>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT reported_by, reported_at FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get::<Option<String>>(0).unwrap(),
+            row.get::<Option<i64>>(1).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_report_claim_is_idempotent_for_the_agent_that_holds_it() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        assert_eq!(
+            db.claim_patchset_report(1, "sashiko-nipa", now)
+                .await
+                .unwrap(),
+            ReportClaim::Ours { since: now }
+        );
+        // Re-asserted on a later pass, as a connector does on every trip
+        // through its queue and after every restart. Still ours, and still
+        // dated from the first claim rather than from this call: the column
+        // says when the patchset was spoken for, not when it was last asked
+        // about.
+        assert_eq!(
+            db.claim_patchset_report(1, "sashiko-nipa", now + 3600)
+                .await
+                .unwrap(),
+            ReportClaim::Ours { since: now }
+        );
+        assert_eq!(
+            report_columns(&db, 1).await,
+            (Some("sashiko-nipa".to_string()), Some(now))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_agent_is_refused_and_told_who_holds_the_patchset() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        db.claim_patchset_report(1, "sashiko-nipa", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.claim_patchset_report(1, "sashiko-simple", now + 60)
+                .await
+                .unwrap(),
+            ReportClaim::Held {
+                agent: "sashiko-nipa".to_string(),
+                since: Some(now),
+            }
+        );
+        // A refusal writes nothing, so the loser cannot move the claim's date
+        // by asking, and the row is only ever one agent's.
+        assert_eq!(
+            report_columns(&db, 1).await,
+            (Some("sashiko-nipa".to_string()), Some(now))
+        );
+        // And it claimed the one patchset it named, not the table.
+        assert_eq!(report_columns(&db, 2).await, (None, None));
+    }
+
+    #[tokio::test]
+    async fn a_report_claim_is_taken_before_there_is_a_review_to_report() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        // Patchset 2 is still 'In Review'. The connectors claim at submit time,
+        // hours before the review exists, which is the only moment the claim is
+        // worth anything: by the time there are findings both of them have
+        // already decided whether to mail. So unlike
+        // claim_patchset_embargo_release this cannot require a status.
+        assert_eq!(
+            db.claim_patchset_report(2, "sashiko-simple", now)
+                .await
+                .unwrap(),
+            ReportClaim::Ours { since: now }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_claim_does_not_go_stale_the_way_a_release_claim_does() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        db.claim_patchset_report(1, "sashiko-nipa", now)
+            .await
+            .unwrap();
+        // A release claim this old is treated as abandoned and retaken, because
+        // the release it guards is work sashiko can safely repeat. This one
+        // guards a mail, so it holds for good: an agent that claims and dies
+        // leaves the review unmailed, which is the side to fail on.
+        let ancient = now + EMBARGO_RELEASE_CLAIM_STALE_SECS + 30 * 86400;
+        assert_eq!(
+            db.claim_patchset_report(1, "sashiko-simple", ancient)
+                .await
+                .unwrap(),
+            ReportClaim::Held {
+                agent: "sashiko-nipa".to_string(),
+                since: Some(now),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_patchset_that_is_not_here_is_not_a_claim() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        // Kept apart from Held so the endpoint can answer "no such patchset"
+        // without spending the 404 it needs for "no such route".
+        assert_eq!(
+            db.claim_patchset_report(404, "sashiko-simple", now)
+                .await
+                .unwrap(),
+            ReportClaim::NotFound
+        );
     }
 
     #[tokio::test]

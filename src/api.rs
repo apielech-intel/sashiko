@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::db::{Database, EmbargoLift, PriorityChange};
+use crate::db::{Database, EmbargoLift, PriorityChange, ReportClaim};
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
 use axum::{
@@ -270,6 +270,16 @@ pub struct EmbargoLiftQuery {
 }
 
 #[derive(Deserialize)]
+pub struct ReportClaimQuery {
+    /// Patchset id, slug, or message-ID, as accepted by `/api/patch`.
+    pub id: String,
+    /// Name of the agent claiming it. A connector should pass the same name it
+    /// posts its patchwork checks under, so a held patchset names something an
+    /// operator can go and look at.
+    pub agent: String,
+}
+
+#[derive(Deserialize)]
 pub struct PatchsetPriorityQuery {
     /// Patchset id, slug, or message-ID, as accepted by `/api/patch`.
     pub id: String,
@@ -415,6 +425,7 @@ pub fn build_router(
             "/api/patchset/embargo/lift-token",
             post(lift_patchset_embargo_token),
         )
+        .route("/api/patchset/report/claim", post(claim_patchset_report))
         .route("/api/patchset/priority", post(set_patchset_priority))
         .route(
             "/api/patchset/priority-token",
@@ -1501,6 +1512,105 @@ async fn lift_embargo(
         // resolve_patchset_id found the row, so this is a delete racing the
         // lift rather than a bad key.
         EmbargoLift::NotFound => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Claims the right to report a patchset's review outside sashiko.
+///
+/// For the patchwork connectors, which mail their own reviews out and lift the
+/// embargo to publish them. A series cross-posted to two lists is one patchset
+/// here and one series on each instance's patchwork, so both connectors submit
+/// the same message-id and get the same review back. Their patchwork checks are
+/// each their own business, but the mail and the embargo are not: the mail would
+/// go out twice, and whichever one lifted the embargo would publish the findings
+/// for both. So the first to ask owns them, and the other reports only through
+/// its own check.
+///
+/// Answers `claimed` or `held` (naming the holder). A patchset sashiko has never
+/// heard of is `unknown` with a 200, not a 404, so that a 404 means exactly one
+/// thing to the caller: this sashiko is too old to have the route at all. A
+/// connector that cannot tell those apart has to choose between never mailing
+/// against an old sashiko and double-mailing against a new one.
+///
+/// Localhost only, and no token twin: the embargo lift has one because the web
+/// UI needs to lift embargoes through the reverse proxy, and nothing in the UI
+/// claims a report.
+async fn claim_patchset_report(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ReportClaimQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // An empty agent would claim the patchset for nobody, and then match every
+    // other caller that also sent nothing.
+    let agent = query.agent.trim();
+    if agent.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let resolved = state.db.resolve_patchset_id(&query.id).await.map_err(|e| {
+        error!("Failed to resolve patchset {}: {}", query.id, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(id) = resolved else {
+        return Ok(Json(serde_json::json!({
+            "status": "unknown",
+            "reason": "No such patchset",
+        })));
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let outcome = state
+        .db
+        .claim_patchset_report(id, agent, now)
+        .await
+        .map_err(|e| {
+            error!("Failed to claim report for patchset {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    match outcome {
+        ReportClaim::Ours { since } => {
+            // Only the first claim is news; a connector re-asserts this one on
+            // every pass through its queue.
+            if since == now {
+                info!("Patchset {} report claimed by {}", id, agent);
+            }
+            Ok(Json(serde_json::json!({
+                "status": "claimed",
+                "id": id,
+                "agent": agent,
+                "since": since,
+            })))
+        }
+        ReportClaim::Held {
+            agent: owner,
+            since,
+        } => {
+            info!(
+                "Refused report claim on patchset {} for {}: held by {}",
+                id, agent, owner
+            );
+            Ok(Json(serde_json::json!({
+                "status": "held",
+                "id": id,
+                "agent": owner,
+                "since": since,
+            })))
+        }
+        // resolve_patchset_id found the row, so this is a delete racing the
+        // claim rather than a bad key.
+        ReportClaim::NotFound => Ok(Json(serde_json::json!({
+            "status": "unknown",
+            "reason": "No such patchset",
+        }))),
     }
 }
 

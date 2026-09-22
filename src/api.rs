@@ -565,7 +565,7 @@ async fn submit_patch(
                 .db
                 .create_fetching_patchset(
                     &id,
-                    &format!("Fetching {} from {}...", &sha, repo_display),
+                    &format!("Fetching {sha} from {repo_display}..."),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
                     None,

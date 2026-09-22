@@ -2012,11 +2012,11 @@ Consolidated Dismissed Concerns:
         // of `runs` on purpose: a stage 10 row there would feed the source status
         // manifest, so a failed ranking run would mark the variant incomplete and
         // change which sources count as having missed a finding.
-        if !ranking_runs.is_empty() {
-            if let Some(object) = model_experiment.as_object_mut() {
-                object.insert("rankings".to_string(), Value::Array(ranking_entries));
-                object.insert("ranking_runs".to_string(), Value::Array(ranking_runs));
-            }
+        if !ranking_runs.is_empty()
+            && let Some(object) = model_experiment.as_object_mut()
+        {
+            object.insert("rankings".to_string(), Value::Array(ranking_entries));
+            object.insert("ranking_runs".to_string(), Value::Array(ranking_runs));
         }
 
         let final_output = json!({
@@ -3469,33 +3469,54 @@ fn materialize_deduplication_group(
     Value::Object(output)
 }
 
+/// A kept concern or a merge of several, tagged with its position in the input
+/// so the output keeps input order whichever of the two lists it came from.
+struct OrderedDeduplicationGroup {
+    order: usize,
+    ids: Vec<String>,
+    base: String,
+    replacements: serde_json::Map<String, Value>,
+}
+
 fn materialize_deduplication_section(
     section: DeduplicationSection,
     inputs: &BTreeMap<String, DeduplicationInputItem>,
     include_provenance: bool,
 ) -> Vec<Value> {
-    let mut groups: Vec<(usize, Vec<String>, String, serde_json::Map<String, Value>)> = section
+    let mut groups: Vec<OrderedDeduplicationGroup> = section
         .keep
         .into_iter()
-        .map(|id| {
-            let order = inputs[&id].order;
-            (order, vec![id.clone()], id, serde_json::Map::new())
+        .map(|id| OrderedDeduplicationGroup {
+            order: inputs[&id].order,
+            ids: vec![id.clone()],
+            base: id,
+            replacements: serde_json::Map::new(),
         })
         .collect();
     groups.extend(section.merges.into_iter().map(|merge| {
-        let order = merge
-            .ids
-            .iter()
-            .filter_map(|id| inputs.get(id).map(|item| item.order))
-            .min()
-            .unwrap_or(usize::MAX);
-        (order, merge.ids, merge.base, merge.replacements)
+        OrderedDeduplicationGroup {
+            order: merge
+                .ids
+                .iter()
+                .filter_map(|id| inputs.get(id).map(|item| item.order))
+                .min()
+                .unwrap_or(usize::MAX),
+            ids: merge.ids,
+            base: merge.base,
+            replacements: merge.replacements,
+        }
     }));
-    groups.sort_by_key(|group| group.0);
+    groups.sort_by_key(|group| group.order);
     groups
         .into_iter()
-        .map(|(_, ids, base, replacements)| {
-            materialize_deduplication_group(&ids, &base, &replacements, inputs, include_provenance)
+        .map(|group| {
+            materialize_deduplication_group(
+                &group.ids,
+                &group.base,
+                &group.replacements,
+                inputs,
+                include_provenance,
+            )
         })
         .collect()
 }

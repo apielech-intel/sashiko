@@ -542,6 +542,12 @@ async fn review_single_patch(
                     budget: Some(ReviewBudget::new(variant_ai.discovery_budget_config())),
                     alternative_prompts: model.alternative_prompts,
                     confirm_priority: model.confirm_priority,
+                    rank_severity: model.rank_severity,
+                    // A ranking run is a merge-stage workload, so it is sized
+                    // from the merge budget rather than the discovery one.
+                    rank_budget: model
+                        .rank_severity
+                        .then(|| variant_ai.merge_budget_config()),
                 }
             })
             .collect::<Vec<_>>();

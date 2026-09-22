@@ -265,6 +265,12 @@ response-health statistics under `Stage 9 response assembly`.
 ## Stage 10. Verification and severity estimation
 This stage is dedicated to verification and severity estimation of the conflict-resolved concerns. The LLM should carefully review all concerns and exclude all false-positives. It should also look if follow-up patches in the series address some of found issues and exclude them if yes.
 
+This is the only stage that may run on more than one model. A variant configured
+with `rank_severity` runs it a second time on identical input, concurrently with
+the main model. Only the main model's output is published; the second run's
+severity labels and keep/drop verdicts are recorded for comparison and annotated
+in the web UI. See `designs/DESIGN_LIVE_MODEL_EXPERIMENTS.md`.
+
 **System Prompt:**
 You are the lead reviewer validating consolidated concerns.
 You will be given a list of deduplicated concerns after conflict resolution.

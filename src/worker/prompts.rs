@@ -313,6 +313,14 @@ pub struct AdditionalModelRunner {
     pub budget: Option<ReviewBudget>,
     pub alternative_prompts: bool,
     pub confirm_priority: i32,
+    /// Run the verification-and-severity stage with this model too, for
+    /// comparison only.
+    pub rank_severity: bool,
+    /// Ledger config for that run. A `BudgetConfig` rather than a `ReviewBudget`
+    /// so each run gets a fresh ledger, the way `validation_budget` does for
+    /// confirmers: ranking must not be able to exhaust the variant's discovery
+    /// budget, nor the main review's merge budget.
+    pub rank_budget: Option<crate::ai::review_budget::BudgetConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -1716,14 +1724,27 @@ Consolidated Dismissed Concerns:
         info!("Running Stage 10 (Verification)");
         let mut findings_json;
         let mut baseline_decisions = std::collections::BTreeMap::new();
+        let ranking_entries: Vec<Value>;
+        let ranking_runs: Vec<Value>;
         {
             let stage = 10;
             let (mut stage_prompt, mut clean_stage_prompt) =
                 self.prompts.get_stage_prompt(stage).await?;
+            // Copied before the main prompt is amended: a ranking run always
+            // needs the experiment guidance, whether the main run does or not.
+            let ranking_prompts = self
+                .additional_models
+                .iter()
+                .any(|model| model.rank_severity)
+                .then(|| {
+                    (
+                        format!("{stage_prompt}{STAGE10_EXPERIMENT_GUIDANCE}"),
+                        format!("{clean_stage_prompt}{STAGE10_EXPERIMENT_GUIDANCE}"),
+                    )
+                });
             if self.cohort.selected_variants().next().is_some() {
-                let guidance = "\n\nMODEL EXPERIMENT: Apply the normal verification rules to every concern and return a top-level baseline_decisions object mapping the first finding_ids value of every input concern to the boolean result. Also retain every concern with requires_validation=true in findings even when its baseline decision is false; a separate validation policy will combine the baseline and independent model decisions. Concerns with requires_validation=false appear in findings only when their baseline decision is true.";
-                stage_prompt.push_str(guidance);
-                clean_stage_prompt.push_str(guidance);
+                stage_prompt.push_str(STAGE10_EXPERIMENT_GUIDANCE);
+                clean_stage_prompt.push_str(STAGE10_EXPERIMENT_GUIDANCE);
             }
             let system_prompt = shared_context.clone();
 
@@ -1765,17 +1786,30 @@ Consolidated Dismissed Concerns:
             );
             let conflict_resolved_concerns_json =
                 serde_json::to_string_pretty(&severity_input).unwrap_or_default();
-            let mut user_prompt = format!(
-                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset; exception: a fix owns its own completeness, even over code predating it, so set false if the bug class its commit message claims to close stays reachable, or if the correct fix would replace rather than extend its approach, and reserve true for defects its commit message neither claims to fix nor relies on), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and \"source_stages\" (the unchanged array from the validated concern). Carry forward the locations and source_stages from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ],\n      \"source_stages\": [3, 4]\n    }}\n  ]\n}}\n```",
-                stage_prompt, full_series_context, conflict_resolved_concerns_json
+            let user_prompt = stage10_user_prompt(
+                &stage_prompt,
+                &full_series_context,
+                &conflict_resolved_concerns_json,
             );
-            user_prompt.push_str("\n\nPROVENANCE REQUIREMENT: Every finding must also include source_models, finding_ids, and requires_validation copied unchanged from its input concern. These fields are required despite any earlier exact-key list.");
-
-            let mut clean_user_prompt = format!(
-                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{{{{series context}}}}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset; exception: a fix owns its own completeness, even over code predating it, so set false if the bug class its commit message claims to close stays reachable, or if the correct fix would replace rather than extend its approach, and reserve true for defects its commit message neither claims to fix nor relies on), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and \"source_stages\" (the unchanged array from the validated concern). Carry forward the locations and source_stages from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ],\n      \"source_stages\": [3, 4]\n    }}\n  ]\n}}\n```",
-                clean_stage_prompt, conflict_resolved_concerns_json
+            let clean_user_prompt = stage10_user_prompt(
+                &clean_stage_prompt,
+                STAGE10_SERIES_CONTEXT_PLACEHOLDER,
+                &conflict_resolved_concerns_json,
             );
-            clean_user_prompt.push_str("\n\nPROVENANCE REQUIREMENT: Every finding must also include source_models, finding_ids, and requires_validation copied unchanged from its input concern. These fields are required despite any earlier exact-key list.");
+            let ranking_prompts = ranking_prompts.map(|(stage_prompt, clean_stage_prompt)| {
+                (
+                    stage10_user_prompt(
+                        &stage_prompt,
+                        &full_series_context,
+                        &conflict_resolved_concerns_json,
+                    ),
+                    stage10_user_prompt(
+                        &clean_stage_prompt,
+                        STAGE10_SERIES_CONTEXT_PLACEHOLDER,
+                        &conflict_resolved_concerns_json,
+                    ),
+                )
+            });
 
             let stage_impl = create_stage(stage);
             let mut session = ReviewStageSession::new(
@@ -1819,7 +1853,15 @@ Consolidated Dismissed Concerns:
                         });
                     }
                 });
-            let result = runner.run(&mut session).await?;
+            // A ranking run reads the same input and publishes nothing, so it
+            // rides alongside the main request instead of costing a second
+            // stage's worth of latency.
+            let (main_result, ranking) = tokio::join!(
+                runner.run(&mut session),
+                self.rank_severity_runs(&shared_context, ranking_prompts.as_ref(), &severity_input),
+            );
+            (ranking_entries, ranking_runs) = ranking;
+            let result = main_result?;
 
             total_tokens_in += result.usage.prompt_tokens as u32;
             total_tokens_out += result.usage.completion_tokens as u32;
@@ -1958,6 +2000,25 @@ Consolidated Dismissed Concerns:
             .as_array()
             .map_or(0, Vec::len);
 
+        let mut model_experiment = json!({
+            "cohort": &self.cohort,
+            "sources": review_source_manifest(&self.cohort, &experiment_runs),
+            "runs": experiment_runs,
+            "comparisons": comparisons,
+            "confirmation_runs": confirmation_runs
+        });
+        // Severity/validity second opinions, added only when a ranking model ran,
+        // so a review without one keeps exactly the blob it has today. Kept out
+        // of `runs` on purpose: a stage 10 row there would feed the source status
+        // manifest, so a failed ranking run would mark the variant incomplete and
+        // change which sources count as having missed a finding.
+        if !ranking_runs.is_empty() {
+            if let Some(object) = model_experiment.as_object_mut() {
+                object.insert("rankings".to_string(), Value::Array(ranking_entries));
+                object.insert("ranking_runs".to_string(), Value::Array(ranking_runs));
+            }
+        }
+
         let final_output = json!({
             "findings": findings_json,
             "dismissed_concerns": deduplicated_dismissed_concerns,
@@ -1969,13 +2030,7 @@ Consolidated Dismissed Concerns:
             ,"merge_usage": self.merge_usage()
             ,"dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
             ,"canonical_candidates": canonical_candidates
-            ,"model_experiment": {
-                "cohort": &self.cohort,
-                "sources": review_source_manifest(&self.cohort, &experiment_runs),
-                "runs": experiment_runs,
-                "comparisons": comparisons,
-                "confirmation_runs": confirmation_runs
-            }
+            ,"model_experiment": model_experiment
         });
 
         Ok(WorkerResult {
@@ -2607,6 +2662,200 @@ Example:
             .collect();
         Ok((json!(filtered), comparisons, confirmation_runs))
     }
+
+    /// Runs the verification-and-severity stage again on every model flagged
+    /// `rank_severity`, to record a second opinion on each concern's severity
+    /// and validity.
+    ///
+    /// Returns `(entries, runs)`. Neither reaches the published review: this is
+    /// a measurement, so a ranking failure is logged and recorded rather than
+    /// propagated, and no caller may feed the result back into `findings`.
+    async fn rank_severity_runs(
+        &self,
+        shared_context: &str,
+        prompts: Option<&(String, String)>,
+        severity_input: &Value,
+    ) -> (Vec<Value>, Vec<Value>) {
+        let Some((user_prompt, clean_user_prompt)) = prompts else {
+            return (Vec::new(), Vec::new());
+        };
+        let rankers: Vec<&AdditionalModelRunner> = self
+            .additional_models
+            .iter()
+            .filter(|model| model.rank_severity)
+            .collect();
+        if rankers.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // The same keys Stage 10 is asked to decide on, so a model that answers
+        // for a concern nobody asked about cannot invent an entry.
+        let expected_ids: std::collections::BTreeSet<String> = severity_input
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["finding_ids"].as_array()?.first()?.as_str())
+            .map(str::to_string)
+            .collect();
+
+        let outcomes = futures::future::join_all(rankers.into_iter().map(|model| {
+            self.rank_with_model(
+                model,
+                shared_context,
+                user_prompt,
+                clean_user_prompt,
+                severity_input,
+                &expected_ids,
+            )
+        }))
+        .await;
+
+        let mut entries = Vec::new();
+        let mut runs = Vec::new();
+        for (model_entries, run) in outcomes {
+            entries.extend(model_entries);
+            runs.push(run);
+        }
+        (entries, runs)
+    }
+
+    /// One ranking model's Stage 10 run. Never returns `Err`: a failure becomes
+    /// a `failed` run record with no entries.
+    async fn rank_with_model(
+        &self,
+        model: &AdditionalModelRunner,
+        shared_context: &str,
+        user_prompt: &str,
+        clean_user_prompt: &str,
+        severity_input: &Value,
+        expected_ids: &std::collections::BTreeSet<String>,
+    ) -> (Vec<Value>, Value) {
+        info!(
+            "Ranking {} concern(s) with {}",
+            expected_ids.len(),
+            model.name
+        );
+        let mut session = ReviewStageSession::new(
+            create_stage(10),
+            shared_context.to_string(),
+            user_prompt.to_string(),
+            clean_user_prompt.to_string(),
+            self.tools.clone(),
+            model.temperature,
+            self.context_tag.as_deref(),
+        );
+        // Requested unconditionally, unlike the main run: the keep/drop boolean
+        // per concern is half of what a ranking run exists to collect.
+        session.require_baseline_decisions(expected_ids.clone());
+        session.require_experiment_findings(severity_input.clone());
+        session.require_provenance(
+            severity_input.as_array().cloned().unwrap_or_default(),
+            false,
+            "findings",
+        );
+        let budget = model.rank_budget.map(ReviewBudget::new);
+        let runner = SessionRunner::new(model.provider.as_ref())
+            // Keep the s10 segment: dump directory names are parsed for the
+            // stage number, and `confirm-<model>` already breaks that.
+            .with_conversation_dump(
+                self.conversation_dumper.clone(),
+                format!("s10-rank-{}", model.name),
+            )
+            .with_budget(budget.clone())
+            .with_max_validation_attempts(3)
+            .with_max_turns(model.max_interactions);
+        let outcome = runner.run(&mut session).await;
+        let snapshot = budget.as_ref().map(ReviewBudget::snapshot);
+
+        let (entries, usage, status, error) = match outcome {
+            Ok(result) => {
+                let usage = (
+                    result.usage.prompt_tokens,
+                    result.usage.completion_tokens,
+                    result.usage.cached_tokens.unwrap_or(0),
+                );
+                match validate_baseline_decisions(
+                    severity_input,
+                    result.output.get("baseline_decisions"),
+                ) {
+                    Ok(decisions) => (
+                        rank_entries(model, expected_ids, &decisions, &result.output),
+                        usage,
+                        "completed",
+                        None,
+                    ),
+                    Err(error) => {
+                        warn!(
+                            "Ranking model {} returned unusable decisions: {}",
+                            model.name, error
+                        );
+                        (Vec::new(), usage, "failed", Some(error.to_string()))
+                    }
+                }
+            }
+            Err(error) => {
+                warn!("Ranking model {} failed: {}", model.name, error);
+                (Vec::new(), (0, 0, 0), "failed", Some(error.to_string()))
+            }
+        };
+
+        let run = json!({
+            "model": model.name,
+            "model_id": model.model_id,
+            "provider_id": model.provider_id,
+            "status": status,
+            "error": error,
+            "tokens_in": usage.0,
+            "tokens_out": usage.1,
+            "tokens_cached": usage.2,
+            "budget_input": snapshot.map(|snapshot| snapshot.input).unwrap_or(0),
+            "budget_output": snapshot.map(|snapshot| snapshot.output).unwrap_or(0),
+            "budget_flags": snapshot.map(|snapshot| snapshot.flags).unwrap_or(0),
+        });
+        (entries, run)
+    }
+}
+
+/// Pairs a ranking model's keep/drop decisions with the severity it gave each
+/// concern it kept. A dropped concern can still carry a severity, because the
+/// experiment guidance makes the model retain validation candidates it rejected.
+fn rank_entries(
+    model: &AdditionalModelRunner,
+    expected_ids: &std::collections::BTreeSet<String>,
+    decisions: &std::collections::BTreeMap<String, bool>,
+    output: &Value,
+) -> Vec<Value> {
+    let mut ranked: std::collections::BTreeMap<&str, &Value> = std::collections::BTreeMap::new();
+    for finding in output["findings"].as_array().into_iter().flatten() {
+        for id in finding["finding_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            ranked.entry(id).or_insert(finding);
+        }
+    }
+    expected_ids
+        .iter()
+        .map(|id| {
+            let verdict = match decisions.get(id) {
+                Some(true) => "kept",
+                Some(false) => "dropped",
+                None => "undecided",
+            };
+            let finding = ranked.get(id.as_str());
+            json!({
+                "model": model.name,
+                "model_id": model.model_id,
+                "provider_id": model.provider_id,
+                "finding_id": id,
+                "verdict": verdict,
+                "severity": finding.and_then(|finding| finding["severity"].as_str()),
+                "severity_explanation": finding
+                    .and_then(|finding| finding["severity_explanation"].as_str()),
+            })
+        })
+        .collect()
 }
 
 /// Attribution label for confirmation decode failures.
@@ -3663,6 +3912,27 @@ fn validate_provenance(inputs: &[Value], outputs: &Value, require_all: bool) -> 
         .into());
     }
     Ok(())
+}
+
+/// Extra Stage 10 obligations once a second model is in play: a keep/drop
+/// boolean for every input concern, and retention of the concerns some other
+/// model has to weigh in on.
+const STAGE10_EXPERIMENT_GUIDANCE: &str = "\n\nMODEL EXPERIMENT: Apply the normal verification rules to every concern and return a top-level baseline_decisions object mapping the first finding_ids value of every input concern to the boolean result. Also retain every concern with requires_validation=true in findings even when its baseline decision is false; a separate validation policy will combine the baseline and independent model decisions. Concerns with requires_validation=false appear in findings only when their baseline decision is true.";
+
+/// Stands in for the series context in the prompt copy kept for response-health
+/// statistics, where the real context would only add noise.
+const STAGE10_SERIES_CONTEXT_PLACEHOLDER: &str = "{{series context}}";
+
+/// Stage 10's user prompt. Shared so the main run and any ranking run are given
+/// byte-identical instructions; a difference here would show up as a model
+/// disagreement that is really a prompt disagreement.
+fn stage10_user_prompt(stage_prompt: &str, series_context: &str, concerns_json: &str) -> String {
+    let mut prompt = format!(
+        "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset; exception: a fix owns its own completeness, even over code predating it, so set false if the bug class its commit message claims to close stays reachable, or if the correct fix would replace rather than extend its approach, and reserve true for defects its commit message neither claims to fix nor relies on), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and \"source_stages\" (the unchanged array from the validated concern). Carry forward the locations and source_stages from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ],\n      \"source_stages\": [3, 4]\n    }}\n  ]\n}}\n```",
+        stage_prompt, series_context, concerns_json
+    );
+    prompt.push_str("\n\nPROVENANCE REQUIREMENT: Every finding must also include source_models, finding_ids, and requires_validation copied unchanged from its input concern. These fields are required despite any earlier exact-key list.");
+    prompt
 }
 
 fn annotate_validation_candidates(
@@ -5187,12 +5457,14 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
-    struct FailingConfirmationProvider;
+    /// A provider that is simply unavailable, for the confirmation and ranking
+    /// paths that must record the failure instead of propagating it.
+    struct FailingProvider;
 
     #[async_trait::async_trait]
-    impl AiProvider for FailingConfirmationProvider {
+    impl AiProvider for FailingProvider {
         async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
-            anyhow::bail!("confirmation unavailable")
+            anyhow::bail!("provider unavailable")
         }
 
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -5201,7 +5473,7 @@ mod tests {
 
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
             crate::ai::ProviderCapabilities {
-                model_name: "failing-confirmation".to_string(),
+                model_name: "failing".to_string(),
                 context_window_size: 1000,
             }
         }
@@ -5577,6 +5849,8 @@ mod tests {
                     budget: None,
                     alternative_prompts: false,
                     confirm_priority: 0,
+                    rank_severity: false,
+                    rank_budget: None,
                 }],
                 cohort: crate::ai::model_experiment::ReviewCohort {
                     main: crate::ai::model_experiment::SourceIdentity {
@@ -5652,7 +5926,7 @@ mod tests {
                 retry_provider: None,
                 additional_models: vec![AdditionalModelRunner {
                     name: "variant".to_string(),
-                    provider: Arc::new(FailingConfirmationProvider),
+                    provider: Arc::new(FailingProvider),
                     temperature: 0.0,
                     max_interactions: 2,
                     model_id: "model-b".to_string(),
@@ -5660,6 +5934,8 @@ mod tests {
                     budget: None,
                     alternative_prompts: false,
                     confirm_priority: 0,
+                    rank_severity: false,
+                    rank_budget: None,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -5705,7 +5981,7 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let worker = Worker::new(
-            Arc::new(FailingConfirmationProvider),
+            Arc::new(FailingProvider),
             Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
             PromptRegistry::new(temp.path().to_path_buf()),
             WorkerConfig {
@@ -5732,6 +6008,8 @@ mod tests {
                     budget: None,
                     alternative_prompts: false,
                     confirm_priority: 0,
+                    rank_severity: false,
+                    rank_budget: None,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -5775,7 +6053,7 @@ mod tests {
     ) -> Worker {
         let names: Vec<&str> = variants.iter().map(|(name, _, _)| *name).collect();
         Worker::new(
-            Arc::new(FailingConfirmationProvider),
+            Arc::new(FailingProvider),
             Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
             PromptRegistry::new(temp.path().to_path_buf()),
             WorkerConfig {
@@ -5804,6 +6082,8 @@ mod tests {
                         budget: None,
                         alternative_prompts: false,
                         confirm_priority: *priority,
+                        rank_severity: false,
+                        rank_budget: None,
                     })
                     .collect(),
                 cohort: test_cohort_with_variants(&names),
@@ -5933,7 +6213,7 @@ mod tests {
     async fn failed_confirmation_reports_unconfirmed_variant_findings() {
         let temp = tempfile::tempdir().unwrap();
         let worker = Worker::new(
-            Arc::new(FailingConfirmationProvider),
+            Arc::new(FailingProvider),
             Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
             PromptRegistry::new(temp.path().to_path_buf()),
             WorkerConfig {
@@ -5952,7 +6232,7 @@ mod tests {
                 retry_provider: None,
                 additional_models: vec![AdditionalModelRunner {
                     name: "variant".to_string(),
-                    provider: Arc::new(FailingConfirmationProvider),
+                    provider: Arc::new(FailingProvider),
                     temperature: 0.0,
                     max_interactions: 2,
                     model_id: "model-b".to_string(),
@@ -5960,6 +6240,8 @@ mod tests {
                     budget: None,
                     alternative_prompts: false,
                     confirm_priority: 0,
+                    rank_severity: false,
+                    rank_budget: None,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -5995,6 +6277,232 @@ mod tests {
         assert_eq!(comparisons[0]["additional_model"], "variant");
         assert_eq!(comparisons[0]["severity"], "Medium");
         assert_eq!(comparisons[0]["preexisting"], false);
+    }
+
+    /// A ranking model's Stage 10 reply: it keeps the first concern at a level
+    /// the main model did not give, and drops the second as a false positive
+    /// while still labelling it.
+    struct RankingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for RankingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some(
+                    json!({
+                        "findings": [
+                            {
+                                "problem": "leak on the error path",
+                                "severity": "Medium",
+                                "severity_explanation": "only reachable under memory pressure",
+                                "preexisting": false,
+                                "locations": [],
+                                "source_stages": [3],
+                                "source_models": ["main"],
+                                "finding_ids": ["main-3-0"],
+                                "requires_validation": true
+                            },
+                            {
+                                "problem": "unchecked return",
+                                "severity": "Low",
+                                "severity_explanation": "the caller cannot fail",
+                                "preexisting": false,
+                                "locations": [],
+                                "source_stages": [4],
+                                "source_models": ["main"],
+                                "finding_ids": ["main-4-0"],
+                                "requires_validation": true
+                            }
+                        ],
+                        "baseline_decisions": {"main-3-0": true, "main-4-0": false}
+                    })
+                    .to_string(),
+                ),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 40,
+                    completion_tokens: 7,
+                    total_tokens: 47,
+                    cached_tokens: Some(3),
+                    cache_write_tokens: None,
+                }),
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            40
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "ranking-mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// The two concerns `RankingProvider` answers for, as Stage 10 receives them.
+    fn ranking_severity_input() -> Value {
+        json!([
+            {
+                "problem": "leak on the error path",
+                "finding_ids": ["main-3-0"],
+                "source_models": ["main"],
+                "source_stages": [3],
+                "requires_validation": true
+            },
+            {
+                "problem": "unchecked return",
+                "finding_ids": ["main-4-0"],
+                "source_models": ["main"],
+                "source_stages": [4],
+                "requires_validation": true
+            }
+        ])
+    }
+
+    fn ranking_worker(
+        main: Arc<dyn AiProvider>,
+        ranker: Arc<dyn AiProvider>,
+        rank_severity: bool,
+        temp: &tempfile::TempDir,
+    ) -> Worker {
+        Worker::new(
+            main,
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            PromptRegistry::new(temp.path().to_path_buf()),
+            WorkerConfig {
+                main_model: "model-a".to_string(),
+                max_input_tokens: 1000,
+                max_interactions: 2,
+                analysis_stage_parallelism: 1,
+                temperature: 0.0,
+                custom_prompt: None,
+                series_range: None,
+                baseline_sha: None,
+                stages: None,
+                dump_conversation: None,
+                budget: None,
+                merge_budget: None,
+                retry_provider: None,
+                additional_models: vec![AdditionalModelRunner {
+                    name: "variant".to_string(),
+                    provider: ranker,
+                    temperature: 0.0,
+                    max_interactions: 2,
+                    model_id: "model-b".to_string(),
+                    provider_id: "test".to_string(),
+                    budget: None,
+                    alternative_prompts: false,
+                    confirm_priority: 0,
+                    rank_severity,
+                    rank_budget: None,
+                }],
+                cohort: test_variant_cohort(),
+                validation_budget: None,
+            },
+        )
+    }
+
+    /// Both judgements are recorded, per concern: the level the ranking model
+    /// gave and its own keep/drop verdict.
+    #[tokio::test]
+    async fn ranking_model_records_severity_and_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ranker = Arc::new(RankingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = ranking_worker(main.clone(), ranker.clone(), true, &temp);
+        let prompts = ("rank these".to_string(), "rank these".to_string());
+
+        let (entries, runs) = worker
+            .rank_severity_runs("context", Some(&prompts), &ranking_severity_input())
+            .await;
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "completed");
+        assert_eq!(runs[0]["model"], "variant");
+        assert_eq!(runs[0]["model_id"], "model-b");
+        assert_eq!(runs[0]["tokens_in"], 40);
+        assert_eq!(runs[0]["tokens_out"], 7);
+        assert_eq!(runs[0]["tokens_cached"], 3);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["finding_id"], "main-3-0");
+        assert_eq!(entries[0]["verdict"], "kept");
+        assert_eq!(entries[0]["severity"], "Medium");
+        assert_eq!(
+            entries[0]["severity_explanation"],
+            "only reachable under memory pressure"
+        );
+        assert_eq!(entries[1]["finding_id"], "main-4-0");
+        assert_eq!(entries[1]["verdict"], "dropped");
+        // A dropped concern keeps its level, so disagreement about validity and
+        // disagreement about severity stay separable in the annotation.
+        assert_eq!(entries[1]["severity"], "Low");
+        // The ranking pass runs on the variant alone; spending a main-model turn
+        // here would charge the published review for a measurement.
+        assert_eq!(ranker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(main.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An unavailable ranking model is recorded as failed and contributes no
+    /// verdicts. `undecided` is never manufactured for a run that never spoke.
+    #[tokio::test]
+    async fn failed_ranking_model_records_a_failed_run_and_no_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = ranking_worker(main.clone(), Arc::new(FailingProvider), true, &temp);
+        let prompts = ("rank these".to_string(), "rank these".to_string());
+
+        let (entries, runs) = worker
+            .rank_severity_runs("context", Some(&prompts), &ranking_severity_input())
+            .await;
+
+        assert!(entries.is_empty());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "failed");
+        assert!(runs[0]["error"].is_string());
+        assert_eq!(main.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Without the flag the ranking path must not run at all, so a review with
+    /// no ranking model keeps today's output.
+    #[tokio::test]
+    async fn unflagged_models_produce_no_ranking_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ranker = Arc::new(RankingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = ranking_worker(main.clone(), ranker.clone(), false, &temp);
+        let prompts = ("rank these".to_string(), "rank these".to_string());
+        let input = ranking_severity_input();
+
+        let (entries, runs) = worker
+            .rank_severity_runs("context", Some(&prompts), &input)
+            .await;
+        assert!(entries.is_empty());
+        assert!(runs.is_empty());
+
+        // And the caller withholds the prompts entirely when nothing is flagged.
+        let (entries, runs) = worker.rank_severity_runs("context", None, &input).await;
+        assert!(entries.is_empty());
+        assert!(runs.is_empty());
+        assert_eq!(ranker.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -6677,6 +7185,8 @@ mod tests {
                 budget: None,
                 alternative_prompts: true,
                 confirm_priority: 0,
+                rank_severity: false,
+                rank_budget: None,
             }],
             cohort: test_variant_cohort(),
             validation_budget: None,

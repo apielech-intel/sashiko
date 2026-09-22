@@ -158,6 +158,34 @@ Successful experiment decisions may confirm or reject unique findings. This
 keeps experiment policy explicit while guaranteeing that experiment failure
 does not weaken normal false-positive filtering.
 
+### Ranking Decisions
+
+A variant configured with `rank_severity` produces a third decision on every
+concern, and that decision is authoritative over nothing:
+
+```text
+RankingDecision
+  verdict: kept | dropped | undecided
+  severity: the variant's own label, or none
+```
+
+It comes from a second, independent run of the verification-and-severity stage
+by that variant, issued concurrently with the main model's and on byte-identical
+input: the same system prompt with the experiment guidance appended, the same
+annotated concern list, the same user prompt. The keep/drop verdict is the
+existing per-concern baseline-decision contract, requested unconditionally for a
+ranking run, so the verdict covers concerns the main model dropped as well as
+the ones it published.
+
+Ranking never participates in publication. `FindingDecision` is unchanged, the
+published findings are not annotated, and the ranking run's own output is read
+only to build comparison records. A ranking failure yields a failed run record
+and no decisions; `undecided` exists for that case and is never an input to
+anything. Ranking runs are deliberately not recorded as experiment runs, because
+those feed the source-participation manifest: a failed ranking run would
+otherwise mark the variant incomplete and change which sources count as having
+missed a finding.
+
 ## Budget Ownership
 
 Every source owns an independent discovery ledger for stages 1 through 7.
@@ -300,6 +328,15 @@ missing completed sources, plus the confirming source when confirmation was
 required. Unsampled and incomplete sources never count as misses. The internal
 `main` sentinel is presented as the configured `[ai].name`; variants use their
 configured experiment names.
+
+A ranking decision joins the same annotation, and only where it disagrees: a
+ranking model that kept the finding at the published level is not mentioned. A
+differing level reads `Ranked <level> by`, grouped per level; a dropped concern
+reads `Called a false positive by`, which takes precedence when a model both
+dropped the finding and still gave it a level. The disagreement alone is enough
+to show the annotation, so it appears on findings every source discovered, where
+no miss would otherwise be reported. The ranking model's severity reasoning is
+carried as hover text on its own clause.
 
 The same presentation manifest accepts completed cross-instance sources. This
 keeps comments accurate when cross-review adds findings or provenance after

@@ -1835,6 +1835,19 @@
                 }
             });
 
+            // Second opinions on severity and validity from a rank_severity model.
+            // Annotation only: nothing here changes a finding, so the map is keyed
+            // by the same synthetic ids and consulted purely for display.
+            const rankingsByFinding = new Map();
+            const rankings = Array.isArray(experiment.rankings) ? experiment.rankings : [];
+            rankings.forEach(entry => {
+                if (typeof entry?.finding_id !== 'string') return;
+                if (!rankingsByFinding.has(entry.finding_id)) {
+                    rankingsByFinding.set(entry.finding_id, []);
+                }
+                rankingsByFinding.get(entry.finding_id).push(entry);
+            });
+
             const displayName = name => byName.get(name)?.display_name || name;
             const resolveName = value => {
                 if (byName.has(value)) return value;
@@ -1849,6 +1862,7 @@
                 incomplete: sources.filter(source => source.status === 'incomplete'),
                 findingsById,
                 confirmations,
+                rankingsByFinding,
                 displayName,
                 resolveName,
                 showSummary: sources.length > 1 || sources.some(source => source.status !== 'completed')
@@ -1877,6 +1891,59 @@
                 rows.push(`<div><strong>Incomplete:</strong> ${format(presentation.incomplete, true)}</div>`);
             }
             return `<div class="review-source-summary">${rows.join('')}</div>`;
+        }
+
+        // A rank_severity model's second opinion earns a line only where it differs
+        // from what we published: a model that agreed stays silent.  Returns ready
+        // made spans, each carrying its own title -- the annotation div's title is
+        // already spoken for by the pre-existing marker.
+        function rankingDisagreements(presentation, finding, findingId) {
+            const byFinding = presentation?.rankingsByFinding;
+            if (!byFinding || byFinding.size === 0) return [];
+            const ids = Array.isArray(finding?.finding_ids)
+                ? finding.finding_ids.filter(id => typeof id === 'string') : [];
+            if (ids.length === 0 && typeof findingId === 'string') ids.push(findingId);
+            const published = String(finding?.severity || '').toLowerCase();
+            const groups = new Map();
+            const record = (key, label, model, tip) => {
+                if (!groups.has(key)) groups.set(key, { label, models: [], tips: [] });
+                const group = groups.get(key);
+                const name = presentation.displayName(model);
+                group.models.push(name);
+                if (tip) group.tips.push(`${name}: ${tip}`);
+            };
+            const seen = new Set();
+            ids.forEach(id => (byFinding.get(id) || []).forEach(entry => {
+                const model = typeof entry?.model === 'string' ? entry.model : '';
+                if (!model || seen.has(model)) return;
+                seen.add(model);
+                const level = typeof entry.severity === 'string' ? entry.severity.trim() : '';
+                const why = typeof entry.severity_explanation === 'string'
+                    ? entry.severity_explanation.trim() : '';
+                if (entry.verdict === 'dropped') {
+                    // Calling it a false positive is the louder disagreement, so it
+                    // takes the phrasing; a level the model still gave goes in the
+                    // tooltip rather than getting its own clause.
+                    record('dropped', 'Called a false positive by', model,
+                        level ? `level ${level}. ${why}`.trim() : why);
+                } else if (level && published && level.toLowerCase() !== published) {
+                    record(`level:${level.toLowerCase()}`, `Ranked ${level} by`, model, why);
+                }
+            }));
+            const order = ['critical', 'high', 'medium', 'low'];
+            const rank = key => {
+                if (key === 'dropped') return -1;
+                const index = order.indexOf(key.slice('level:'.length));
+                return index === -1 ? order.length : index;
+            };
+            return [...groups.entries()]
+                .sort((a, b) => rank(a[0]) - rank(b[0]))
+                .map(([, group]) => {
+                    const tip = group.tips.join(' · ');
+                    const title = tip ? ` title="${escapeHtml(tip)}"` : '';
+                    return `<span${title}>${group.label}: ` +
+                        `${group.models.map(name => escapeHtml(name)).join(', ')}</span>`;
+                });
         }
 
         function escapeHtml(text, highlightDiff = false, renderAiComments = false, sourcePresentation = null) {
@@ -2087,18 +2154,27 @@
                         const completed = (sourcePresentation?.completed || []).filter(source =>
                             block.findingId || source.kind !== 'cross_review');
                         const missed = completed.filter(source => !discovered.includes(source.name));
-                        if (hasParticipation && discovered.length > 0 && missed.length > 0) {
+                        const rankingNotes = rankingDisagreements(
+                            sourcePresentation, finding, block.findingId);
+                        // A ranking disagreement is worth the line on its own, even
+                        // where every source found the thing and there is no miss to
+                        // report.
+                        if (hasParticipation && discovered.length > 0 &&
+                            (missed.length > 0 || rankingNotes.length > 0)) {
                             const discoveredText = discovered
                                 .map(source => escapeHtml(sourcePresentation.displayName(source)))
                                 .join(', ');
-                            const missedText = missed
-                                .map(source => escapeHtml(source.display_name || source.name))
-                                .join(', ');
-                            let annotation = `Discovered by: ${discoveredText} · Missed by: ${missedText}`;
-                            if (confirmedBy) {
-                                annotation += ` · Confirmed by: ${escapeHtml(sourcePresentation.displayName(confirmedBy))}`;
+                            const parts = [`Discovered by: ${discoveredText}`];
+                            if (missed.length > 0) {
+                                parts.push(`Missed by: ${missed
+                                    .map(source => escapeHtml(source.display_name || source.name))
+                                    .join(', ')}`);
                             }
-                            resultHtml += `<div class="diff-line ai-comment${blockClass} ai-comment-source"${preTitle}>${annotation}</div>`;
+                            if (confirmedBy) {
+                                parts.push(`Confirmed by: ${escapeHtml(sourcePresentation.displayName(confirmedBy))}`);
+                            }
+                            parts.push(...rankingNotes);
+                            resultHtml += `<div class="diff-line ai-comment${blockClass} ai-comment-source"${preTitle}>${parts.join(' · ')}</div>`;
                         } else if (!hasParticipation && discovered.length > 0) {
                             const label = discovered.length === 1 ? 'Source' : 'Sources';
                             resultHtml += `<div class="diff-line ai-comment${blockClass} ai-comment-source"${preTitle}>${label}: ${discovered.join(', ')}</div>`;

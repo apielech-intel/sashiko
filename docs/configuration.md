@@ -171,6 +171,29 @@ alternative_prompts = true
 | `api_timeout_secs` | integer | main setting | Provider request timeout override. |
 | `alternative_prompts` | boolean | `false` | Use the alternative Rust prompt profile while retaining the selected provider/model settings and vendored guidance. |
 | `confirm_priority` | integer | `0` | Preference for confirming findings only the main model reported. Among the models that completed the finding's stages, the highest value confirms; equal values fall back to the model name order. May be negative to rank a model below the unset default. |
+| `rank_severity` | boolean | `false` | Also run the verification-and-severity stage with this model, recording its severity labels and false-positive verdicts for comparison. Annotation only: the published review is identical either way. |
+
+Severity is assigned in exactly one stage, Verification and severity estimation,
+which in the same request filters false positives and labels every surviving
+finding. That stage normally runs on the main model alone. `rank_severity` adds a
+second, independent run of it by the selected variant, on byte-identical input
+and concurrent with the main request, so the wall-clock cost is roughly nothing
+and the token cost is roughly one more merge stage per review per ranking model.
+The run owns a fresh ledger sized from `[ai.merge_budget]`, so it can neither
+exhaust the variant's discovery budget nor trip the main model's warning flags.
+
+Both of that run's judgements are recorded: the severity label and its own
+keep/drop verdict on every concern the main model considered. Neither is acted
+on. The result never touches the published findings, the mailed report, the
+patchwork check state or a cross-review payload; it appears only on the review
+page, inline beside the per-finding source list, and only where it disagrees with
+what was published. A failed ranking run is recorded as failed and changes
+nothing else.
+
+`rank_severity` shares the `confirm_priority` sub-table hazard above: declare it
+under its own `[[ai.additional_models]]` header and above any
+`[ai.additional_models.*]` sub-table, or the key binds to the sub-table and is
+dropped without an error.
 
 Each selected model owns an independent budget ledger. The optional
 `[ai.additional_models.budget]` table accepts the same keys as `[ai.budget]`

@@ -685,6 +685,10 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_sources_review ON model_experiment_sources(review_id)",
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_findings_review ON model_experiment_findings(review_id)",
             "CREATE INDEX IF NOT EXISTS idx_model_confirmation_runs_review ON model_confirmation_runs(review_id)",
+            "CREATE TABLE IF NOT EXISTS model_ranking_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, model TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_input INTEGER NOT NULL DEFAULT 0, budget_output INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE INDEX IF NOT EXISTS idx_model_ranking_runs_review ON model_ranking_runs(review_id)",
+            "CREATE TABLE IF NOT EXISTS model_ranking_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, model TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', finding_id TEXT NOT NULL, verdict TEXT NOT NULL, severity TEXT, severity_explanation TEXT, main_severity TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE INDEX IF NOT EXISTS idx_model_ranking_findings_review ON model_ranking_findings(review_id)",
             "CREATE TABLE IF NOT EXISTS cross_review_jobs (id INTEGER PRIMARY KEY, patchset_id INTEGER NOT NULL, source_name TEXT NOT NULL, source_url TEXT NOT NULL, local_model TEXT NOT NULL DEFAULT '', local_provider TEXT NOT NULL DEFAULT '', lookup_message_id TEXT NOT NULL, fallback_message_id TEXT, generation INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', first_attempt_at INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL, deadline_at INTEGER NOT NULL, lease_until INTEGER, lease_token TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, completed_at INTEGER, remote_model TEXT, remote_provider TEXT, payload_hash TEXT, merge_tokens_in INTEGER NOT NULL DEFAULT 0, merge_tokens_out INTEGER NOT NULL DEFAULT 0, merge_tokens_cached INTEGER NOT NULL DEFAULT 0, merge_budget_flags INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(patchset_id) REFERENCES patchsets(id), UNIQUE(patchset_id, generation, source_name))",
             "CREATE INDEX IF NOT EXISTS idx_cross_review_jobs_due ON cross_review_jobs(status, next_attempt_at, lease_until)",
             "CREATE TABLE IF NOT EXISTS cross_review_findings (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, finding_id TEXT NOT NULL, patch_message_id TEXT NOT NULL, finding_json TEXT NOT NULL, accepted INTEGER, FOREIGN KEY(job_id) REFERENCES cross_review_jobs(id), UNIQUE(job_id, finding_id))",
@@ -2610,6 +2614,18 @@ impl Database {
                 libsql::params![review_id],
             )
             .await?;
+        connection
+            .execute(
+                "DELETE FROM model_ranking_runs WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        connection
+            .execute(
+                "DELETE FROM model_ranking_findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
 
         let runs = experiment["runs"].as_array().cloned().unwrap_or_default();
         let mut sources: Vec<(String, String, String, bool)> = Vec::new();
@@ -2791,6 +2807,51 @@ impl Database {
                         run["budget_output"].as_i64().unwrap_or_default(),
                         run["budget_flags"].as_i64().unwrap_or_default(),
                         now,
+                    ],
+                )
+                .await?;
+        }
+        for run in experiment["ranking_runs"].as_array().into_iter().flatten() {
+            connection
+                .execute(
+                    "INSERT INTO model_ranking_runs (review_id, model, model_id, provider_id, status, error, tokens_in, tokens_out, tokens_cached, budget_input, budget_output, budget_flags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        run["model"].as_str().unwrap_or("unknown"),
+                        run["model_id"].as_str().unwrap_or("unknown"),
+                        run["provider_id"].as_str().unwrap_or("unknown"),
+                        run["status"].as_str().unwrap_or("failed"),
+                        run["error"].as_str(),
+                        run["tokens_in"].as_i64().unwrap_or_default(),
+                        run["tokens_out"].as_i64().unwrap_or_default(),
+                        run["tokens_cached"].as_i64().unwrap_or_default(),
+                        run["budget_input"].as_i64().unwrap_or_default(),
+                        run["budget_output"].as_i64().unwrap_or_default(),
+                        run["budget_flags"].as_i64().unwrap_or_default(),
+                        now,
+                    ],
+                )
+                .await?;
+        }
+        // The ranking run is concurrent with the main one, so it cannot know the
+        // label it is being compared against. Snapshot it here instead, from the
+        // same published-finding lookup the comparisons use; a concern the main
+        // model dropped has no published label, so this stays NULL.
+        for entry in experiment["rankings"].as_array().into_iter().flatten() {
+            let finding_id = entry["finding_id"].as_str().unwrap_or("unknown");
+            connection
+                .execute(
+                    "INSERT INTO model_ranking_findings (review_id, model, model_id, provider_id, finding_id, verdict, severity, severity_explanation, main_severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        entry["model"].as_str().unwrap_or("unknown"),
+                        entry["model_id"].as_str().unwrap_or("unknown"),
+                        entry["provider_id"].as_str().unwrap_or("unknown"),
+                        finding_id,
+                        entry["verdict"].as_str().unwrap_or("undecided"),
+                        entry["severity"].as_str(),
+                        entry["severity_explanation"].as_str(),
+                        published.get(finding_id).map(|published| published.0),
                     ],
                 )
                 .await?;
@@ -12119,6 +12180,93 @@ mod tests {
         assert_eq!(cross_review["tokens_in"], 30);
         assert_eq!(cross_review["tokens_out"], 3);
         assert_eq!(cross_review["tokens_cached"], 2);
+    }
+
+    /// Ranking records are annotation, but they still have to survive the save
+    /// and a re-save: a re-rendered review must not accumulate duplicate
+    /// verdicts, and the published label they were compared against is
+    /// snapshotted here because the ranking run could not know it.
+    #[tokio::test]
+    async fn ranking_records_round_trip_and_survive_a_resave() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO reviews (id, patchset_id, status, created_at)
+                    VALUES (99, 1, 'Reviewed', 1000);",
+            )
+            .await
+            .unwrap();
+
+        let experiment = json!({
+            "rankings": [
+                {"model": "variant", "model_id": "model-b", "provider_id": "claude",
+                 "finding_id": "f1", "verdict": "kept", "severity": "Medium",
+                 "severity_explanation": "only under memory pressure"},
+                {"model": "variant", "model_id": "model-b", "provider_id": "claude",
+                 "finding_id": "f2", "verdict": "dropped", "severity": null,
+                 "severity_explanation": null}
+            ],
+            "ranking_runs": [
+                {"model": "variant", "model_id": "model-b", "provider_id": "claude",
+                 "status": "completed", "tokens_in": 40, "tokens_out": 4,
+                 "tokens_cached": 3, "budget_input": 40, "budget_output": 4,
+                 "budget_flags": 0}
+            ]
+        });
+        // The main model dropped f2, so it has no published label: main_severity
+        // must stay NULL there rather than borrow the other finding's.
+        let findings = json!([{"finding_ids": ["f1"], "severity": "High", "preexisting": false}]);
+
+        for _ in 0..2 {
+            db.save_model_experiment(99, &experiment, &findings)
+                .await
+                .unwrap();
+        }
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT finding_id, verdict, severity, main_severity FROM model_ranking_findings \
+                 WHERE review_id = 99 ORDER BY finding_id",
+                (),
+            )
+            .await
+            .unwrap();
+        let kept = rows.next().await.unwrap().unwrap();
+        assert_eq!(kept.get::<String>(0).unwrap(), "f1");
+        assert_eq!(kept.get::<String>(1).unwrap(), "kept");
+        assert_eq!(
+            kept.get::<Option<String>>(2).unwrap().as_deref(),
+            Some("Medium")
+        );
+        assert_eq!(
+            kept.get::<Option<String>>(3).unwrap().as_deref(),
+            Some("High")
+        );
+        let dropped = rows.next().await.unwrap().unwrap();
+        assert_eq!(dropped.get::<String>(0).unwrap(), "f2");
+        assert_eq!(dropped.get::<String>(1).unwrap(), "dropped");
+        assert!(dropped.get::<Option<String>>(2).unwrap().is_none());
+        assert!(dropped.get::<Option<String>>(3).unwrap().is_none());
+        assert!(rows.next().await.unwrap().is_none());
+        drop(rows);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT count(*), max(status), max(tokens_in), max(budget_input) \
+                 FROM model_ranking_runs WHERE review_id = 99",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row.get::<String>(1).unwrap(), "completed");
+        assert_eq!(row.get::<i64>(2).unwrap(), 40);
+        assert_eq!(row.get::<i64>(3).unwrap(), 40);
     }
 
     #[tokio::test]

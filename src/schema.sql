@@ -331,6 +331,44 @@ CREATE TABLE IF NOT EXISTS model_confirmation_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_model_confirmation_runs_review ON model_confirmation_runs(review_id);
 
+CREATE TABLE IF NOT EXISTS model_ranking_runs (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    model_id TEXT NOT NULL DEFAULT '',
+    provider_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'completed',
+    error TEXT,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    tokens_cached INTEGER NOT NULL DEFAULT 0,
+    budget_input INTEGER NOT NULL DEFAULT 0,
+    budget_output INTEGER NOT NULL DEFAULT 0,
+    budget_flags INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(review_id) REFERENCES reviews(id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_ranking_runs_review ON model_ranking_runs(review_id);
+
+-- A ranking model's second opinion on a concern the main model verified: its
+-- severity label and its own false-positive verdict. Annotation only; nothing
+-- here feeds the published review. Severity is TEXT to match the other
+-- experiment tables, not findings.severity's 1-4 integer.
+CREATE TABLE IF NOT EXISTS model_ranking_findings (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    model_id TEXT NOT NULL DEFAULT '',
+    provider_id TEXT NOT NULL DEFAULT '',
+    finding_id TEXT NOT NULL,
+    verdict TEXT NOT NULL, -- 'kept', 'dropped' or 'undecided'
+    severity TEXT, -- the ranking model's label, NULL when it gave none
+    severity_explanation TEXT,
+    main_severity TEXT, -- snapshot of the published label compared against
+    FOREIGN KEY(review_id) REFERENCES reviews(id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_ranking_findings_review ON model_ranking_findings(review_id);
+
 CREATE TABLE IF NOT EXISTS cross_review_jobs (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,

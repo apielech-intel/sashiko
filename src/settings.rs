@@ -354,6 +354,12 @@ pub struct AdditionalModelSettings {
     /// order. Negative values rank a variant below the unset default.
     #[serde(default)]
     pub confirm_priority: i32,
+    /// Also run the verification-and-severity stage with this model, recording
+    /// its severity labels and false-positive verdicts for comparison. The
+    /// published review is identical either way: a ranking run is annotation
+    /// only and owns a budget ledger the main review never reads.
+    #[serde(default)]
+    pub rank_severity: bool,
     #[serde(default)]
     pub budget: SourceBudgetSettings,
     #[serde(default)]
@@ -1277,6 +1283,69 @@ mod tests {
                 .and_then(|openai| openai.base_url.as_deref()),
             Some("https://gateway-two.azure-api.net/openai/responses")
         );
+    }
+
+    /// Ranking has to stay off unless a deployment asks for it: the flag costs a
+    /// whole extra verification stage per review.
+    #[test]
+    fn rank_severity_defaults_to_off() {
+        let unset: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
+            "name": "variant",
+            "probability": 0.5
+        }))
+        .unwrap();
+        assert!(!unset.rank_severity);
+
+        let enabled: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
+            "name": "variant",
+            "probability": 0.5,
+            "rank_severity": true
+        }))
+        .unwrap();
+        assert!(enabled.rank_severity);
+    }
+
+    /// Same sub-table footgun as `confirm_priority`: below a provider sub-table
+    /// header the key belongs to that sub-table, which accepts unknown keys, so
+    /// ranking would be silently off with no error to read.
+    #[test]
+    fn rank_severity_binds_to_its_own_entry() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            ai: AiSettings,
+        }
+
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+                [ai]
+                provider = "bedrock"
+                model = "opus-primary"
+
+                [[ai.additional_models]]
+                name = "azure-one"
+                probability = 1.0
+                provider = "openai-responses"
+                model = "gpt-5.6-one"
+                rank_severity = true
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://gateway-one.azure-api.net/openai/responses"
+
+                [[ai.additional_models]]
+                name = "azure-two"
+                probability = 1.0
+                provider = "openai-responses"
+                model = "gpt-6-two"
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://gateway-two.azure-api.net/openai/responses"
+            "#,
+        )
+        .unwrap();
+        let ai = wrapper.ai;
+
+        assert!(ai.additional_models[0].rank_severity);
+        assert!(!ai.additional_models[1].rank_severity);
     }
 
     #[test]

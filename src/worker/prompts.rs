@@ -1891,6 +1891,28 @@ Consolidated Dismissed Concerns:
             progress_cb(WorkerProgressEvent::StageFinished { stage: 10 });
         }
 
+        // Assembled here rather than next to the final output, because the
+        // no-findings return below is a second exit that has to carry the same
+        // record. Severity/validity second opinions are added only when a
+        // ranking model ran, so a review without one keeps exactly the blob it
+        // has today. Kept out of `runs` on purpose: a stage 10 row there would
+        // feed the source status manifest, so a failed ranking run would mark
+        // the variant incomplete and change which sources count as having
+        // missed a finding.
+        let mut model_experiment = json!({
+            "cohort": &self.cohort,
+            "sources": review_source_manifest(&self.cohort, &experiment_runs),
+            "runs": experiment_runs,
+            "comparisons": comparisons,
+            "confirmation_runs": confirmation_runs
+        });
+        if !ranking_runs.is_empty()
+            && let Some(object) = model_experiment.as_object_mut()
+        {
+            object.insert("rankings".to_string(), Value::Array(ranking_entries));
+            object.insert("ranking_runs".to_string(), Value::Array(ranking_runs));
+        }
+
         if let Some(f) = findings_json.as_array()
             && f.is_empty()
         {
@@ -1908,13 +1930,7 @@ Consolidated Dismissed Concerns:
                     .map_or(0, Vec::len),
                 "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
                 ,"canonical_candidates": canonical_candidates
-                ,"model_experiment": {
-                    "cohort": &self.cohort,
-                    "sources": review_source_manifest(&self.cohort, &experiment_runs),
-                    "runs": experiment_runs,
-                    "comparisons": comparisons,
-                    "confirmation_runs": confirmation_runs
-                }
+                ,"model_experiment": model_experiment
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1999,25 +2015,6 @@ Consolidated Dismissed Concerns:
         let dismissed_concerns_count = deduplicated_dismissed_concerns
             .as_array()
             .map_or(0, Vec::len);
-
-        let mut model_experiment = json!({
-            "cohort": &self.cohort,
-            "sources": review_source_manifest(&self.cohort, &experiment_runs),
-            "runs": experiment_runs,
-            "comparisons": comparisons,
-            "confirmation_runs": confirmation_runs
-        });
-        // Severity/validity second opinions, added only when a ranking model ran,
-        // so a review without one keeps exactly the blob it has today. Kept out
-        // of `runs` on purpose: a stage 10 row there would feed the source status
-        // manifest, so a failed ranking run would mark the variant incomplete and
-        // change which sources count as having missed a finding.
-        if !ranking_runs.is_empty()
-            && let Some(object) = model_experiment.as_object_mut()
-        {
-            object.insert("rankings".to_string(), Value::Array(ranking_entries));
-            object.insert("ranking_runs".to_string(), Value::Array(ranking_runs));
-        }
 
         let final_output = json!({
             "findings": findings_json,

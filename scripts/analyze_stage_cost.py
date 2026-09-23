@@ -62,6 +62,7 @@ from pathlib import Path
 BASE_RATES = {
     "fable-5-1": (10.0, 50.0),
     "fable-5": (10.0, 50.0),
+    "opus-5-5": (4.0, 20.0),
     "opus-5": (5.0, 25.0),
     "opus-4-8": (5.0, 25.0),
     "opus-4-7": (5.0, 25.0),
@@ -79,6 +80,11 @@ SONNET_5_INTRO = (2.0, 10.0)
 
 CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25
+# Models whose cache read breaks from the 0.1x rule.  Opus 5.5 lists $0.20 on
+# a $4 input, both from Anthropic and on Bedrock's global endpoint.
+CACHE_READ_OVERRIDES = {
+    "opus-5-5": 0.05,
+}
 
 # Longest first so "opus-4-7" wins over a hypothetical "opus-4" prefix.
 RATE_KEYS = sorted(BASE_RATES, key=len, reverse=True)
@@ -179,7 +185,7 @@ def rates_for(model: str, sonnet_intro: bool):
         base_in, base_out = SONNET_5_INTRO
     return (
         base_in,
-        base_in * CACHE_READ_MULTIPLIER,
+        base_in * CACHE_READ_OVERRIDES.get(key, CACHE_READ_MULTIPLIER),
         base_in * CACHE_WRITE_MULTIPLIER,
         base_out,
     )
@@ -645,7 +651,7 @@ def main():
         print(f"  UNPRICED (excluded, no rate known): {', '.join(unpriced)}")
     print(
         f"  rates: cache read {CACHE_READ_MULTIPLIER}x input, cache write "
-        f"{CACHE_WRITE_MULTIPLIER}x input; Sonnet 5 at "
+        f"{CACHE_WRITE_MULTIPLIER}x input (Opus 5.5 reads at 0.05x); Sonnet 5 at "
         f"{'introductory' if args.sonnet_5_intro else 'standard'} pricing"
     )
     if args.view == "executor":

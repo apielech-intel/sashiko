@@ -551,7 +551,7 @@ async fn review_single_patch(
                 }
             })
             .collect::<Vec<_>>();
-        let prompts_tool_path = Some(options.prompts.join("tool.md"));
+        let prompts_tool_path = Some(options.prompts.clone());
 
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index) {

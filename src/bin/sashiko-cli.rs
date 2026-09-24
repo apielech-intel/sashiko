@@ -155,8 +155,8 @@ enum Commands {
     },
     /// Cancel a pending review
     Cancel {
-        /// ID of the patchset to cancel
-        id: i64,
+        /// Patchset ID, slug, or message-ID of the cover letter or any patch
+        id: String,
 
         /// Force cancel even if the review is already in progress
         #[arg(long, short)]
@@ -1403,11 +1403,15 @@ async fn handle_rerun(
 async fn handle_cancel(
     client: &Client,
     base_url: &str,
-    id: i64,
+    id: String,
     force: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    let url = format!("{}/api/patchset/cancel?id={}&force={}", base_url, id, force);
+    let key = encode_patchset_key(&id);
+    let url = format!(
+        "{}/api/patchset/cancel?id={}&force={}",
+        base_url, key, force
+    );
     let resp = client.post(&url).send().await?;
 
     if resp.status().is_success() {
@@ -1417,8 +1421,9 @@ async fn handle_cancel(
             OutputFormat::Text => {
                 let status = result["status"].as_str().unwrap_or("");
                 if status == "cancelled" {
+                    let patchset = result["id"].as_i64().unwrap_or_default();
                     print_colored(Color::Green, "Cancelled: ");
-                    println!("Patchset {} has been cancelled.", id);
+                    println!("Patchset {} has been cancelled.", patchset);
                 } else {
                     print_colored(Color::Yellow, "Not modified: ");
                     println!(
@@ -1430,6 +1435,8 @@ async fn handle_cancel(
                 }
             }
         }
+    } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("No patchset matches '{}'", id));
     } else {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1445,6 +1452,10 @@ async fn handle_cancel(
 /// that a query string reads as separators. The angle brackets a message-ID is
 /// usually quoted in are dropped, since that is how it is copied out of a mail
 /// client and not part of the value.
+///
+/// A message-ID copied out of a lore URL arrives with its `@` escaped as `%40`.
+/// Stored message-IDs always carry a literal `@`, so a key with no `@` of its
+/// own has the escape undone rather than being escaped again to `%2540`.
 fn encode_patchset_key(id: &str) -> String {
     const QUERY_VALUE_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
         .add(b'&')
@@ -1453,11 +1464,13 @@ fn encode_patchset_key(id: &str) -> String {
         .add(b'#')
         .add(b' ')
         .add(b'%');
-    percent_encoding::utf8_percent_encode(
-        id.trim_matches(|c| c == '<' || c == '>'),
-        QUERY_VALUE_ENCODE,
-    )
-    .to_string()
+    let id = id.trim_matches(|c| c == '<' || c == '>');
+    let id = if id.contains('@') {
+        id.to_string()
+    } else {
+        id.replace("%40", "@")
+    };
+    percent_encoding::utf8_percent_encode(&id, QUERY_VALUE_ENCODE).to_string()
 }
 
 async fn handle_lift_embargo(
@@ -2155,6 +2168,22 @@ fn format_timestamp(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_patchset_key_undoes_lore_at_escape() {
+        assert_eq!(
+            encode_patchset_key("v3-1-9266ddaf3129%40secunet.com"),
+            "v3-1-9266ddaf3129@secunet.com"
+        );
+        assert_eq!(
+            encode_patchset_key("<v3-1-9266ddaf3129@secunet.com>"),
+            "v3-1-9266ddaf3129@secunet.com"
+        );
+        // A key that already has its `@` keeps any other `%` escaped.
+        assert_eq!(encode_patchset_key("a%40b@c.com"), "a%2540b@c.com");
+        assert_eq!(encode_patchset_key("6822"), "6822");
+        assert_eq!(encode_patchset_key("a+b&c@d.com"), "a%2Bb%26c@d.com");
+    }
     use serde_json::json;
 
     #[test]

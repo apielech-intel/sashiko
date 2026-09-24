@@ -258,7 +258,8 @@ pub struct SubsystemQuery {
 
 #[derive(Deserialize)]
 pub struct CancelQuery {
-    pub id: i64,
+    /// Patchset id, slug, or message-ID, as `resolve_patchset_id` takes it.
+    pub id: String,
     #[serde(default)]
     pub force: bool,
 }
@@ -1372,18 +1373,28 @@ async fn cancel_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let cancelled = state
+    let id = state
         .db
-        .cancel_patchset(query.id, query.force)
+        .resolve_patchset_id(&query.id)
         .await
         .map_err(|e| {
-            error!("Failed to cancel patchset {}: {}", query.id, e);
+            error!("Failed to resolve patchset {}: {}", query.id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let cancelled = state
+        .db
+        .cancel_patchset(id, query.force)
+        .await
+        .map_err(|e| {
+            error!("Failed to cancel patchset {}: {}", id, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     if cancelled {
-        info!("Patchset {} cancelled (force={})", query.id, query.force);
-        Ok(Json(serde_json::json!({ "status": "cancelled" })))
+        info!("Patchset {} cancelled (force={})", id, query.force);
+        Ok(Json(serde_json::json!({ "status": "cancelled", "id": id })))
     } else {
         let reason = if query.force {
             "Patchset is not in a cancellable state (must be Pending, Incomplete, or In Review)"
@@ -1392,6 +1403,7 @@ async fn cancel_patchset(
         };
         Ok(Json(serde_json::json!({
             "status": "not_modified",
+            "id": id,
             "reason": reason
         })))
     }

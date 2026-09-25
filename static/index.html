@@ -2945,6 +2945,61 @@
             setTimeout(() => router(), 1500);
         }
 
+        // Behind the queue banner's "Cancel" button, on the token-authorized
+        // cancel endpoint for the reason setQueuePriority uses the token one.
+        //
+        // Never forced: the banner only shows for a pending patchset, and one the
+        // reviewer loop claimed while the page was open is refused rather than
+        // having its running review killed from a stale page.
+        async function cancelReview(patchsetId, btn) {
+            if (!confirm('Cancel this patchset\'s review? It leaves the queue and is not reviewed.')) return;
+
+            const note = document.getElementById('queuePriorityNote');
+            const say = (msg, color) => {
+                if (!note) return;
+                note.style.display = 'block';
+                note.style.color = `var(${color})`;
+                note.textContent = msg;
+            };
+
+            btn.disabled = true;
+            say('Cancelling…', '--text-dim');
+
+            let res;
+            try {
+                res = await apiFetch(
+                    `api/patchset/cancel-token?id=${encodeURIComponent(patchsetId)}`,
+                    { method: 'POST' });
+            } catch (e) {
+                btn.disabled = false;
+                say(`Request failed: ${e.message}`, '--error-title');
+                return;
+            }
+
+            if (!res.ok) {
+                btn.disabled = false;
+                if (res.status === 401) {
+                    say('Refused: this server does not accept the bypass token stored in this browser.', '--error-title');
+                } else if (res.status === 403) {
+                    say('Refused: this instance is read-only.', '--error-title');
+                } else {
+                    say(`Failed: ${res.status} ${res.statusText}`, '--error-title');
+                }
+                return;
+            }
+
+            const body = await res.json().catch(() => ({}));
+            if (body.status !== 'cancelled') {
+                say(body.reason || 'Patchset could not be cancelled.', '--text-dim');
+                // Most likely claimed for review since the page rendered.
+                setTimeout(() => router(), 1500);
+                return;
+            }
+
+            say('Cancelled.', '--status-pending');
+            setTimeout(() => router(), 1500);
+        }
+
         function ordinal(n) {
             const rest = n % 100;
             if (rest >= 11 && rest <= 13) return `${n}th`;
@@ -3251,10 +3306,15 @@
                 // authorizes the endpoint. Numeric id only, for the reason the
                 // embargo button takes one: it goes into an onclick attribute.
                 const canLift = getBypassToken() && Number.isInteger(data.id);
-                const buttonHtml = !canLift ? ''
+                const priorityBtnHtml = !canLift ? ''
                     : lifted
                         ? `<button onclick="setQueuePriority(${data.id}, 0, this)" title="Return this patchset to ordinary oldest-first queue order">Clear high priority</button>`
                         : `<button onclick="setQueuePriority(${data.id}, 1, this)" title="Review this patchset ahead of everything else waiting">High priority</button>`;
+                // Same token, same banner: cancelling is the other thing done
+                // to a patchset that is still waiting.
+                const cancelBtnHtml = !canLift ? ''
+                    : `<button onclick="cancelReview(${data.id}, this)" title="Take this patchset out of the queue without reviewing it">Cancel</button>`;
+                const buttonHtml = priorityBtnHtml + cancelBtnHtml;
                 queueHtml = `
                     <div class="section" style="margin-bottom:16px; border-left:4px solid var(--status-pending);">
                         <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">

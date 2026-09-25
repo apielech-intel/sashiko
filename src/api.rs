@@ -421,6 +421,7 @@ pub fn build_router(
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
+        .route("/api/patchset/cancel-token", post(cancel_patchset_token))
         .route("/api/patchset/embargo/lift", post(lift_patchset_embargo))
         .route(
             "/api/patchset/embargo/lift-token",
@@ -1360,6 +1361,10 @@ async fn rerun_patchset(
     Ok(Json(serde_json::json!({ "status": "accepted" })))
 }
 
+/// Cancels a patchset's review.
+///
+/// Localhost only, like the other write endpoints. `cancel_patchset_token` is
+/// the same operation for a client that authorizes with a token instead.
 async fn cancel_patchset(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -1373,30 +1378,66 @@ async fn cancel_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    cancel_review(&state, &query.id, query.force, "localhost").await
+}
+
+/// Cancels a patchset's review on the strength of an embargo-bypass token.
+///
+/// Split from the loopback route for the reason [`lift_patchset_embargo_token`]
+/// is: the web UI reaches the API through a reverse proxy, so every request it
+/// makes already looks like localhost.
+///
+/// Never forced, whatever the query says: a token holder can take a patchset
+/// out of the queue but not kill a review already running.
+async fn cancel_patchset_token(
+    BypassEmbargo(authorized): BypassEmbargo,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CancelQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !authorized {
+        info!(
+            "Refused token cancel for {}: no configured token presented",
+            query.id
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    cancel_review(&state, &query.id, false, "token").await
+}
+
+/// Writes the cancellation, behind both cancel endpoints.
+///
+/// `how` says which endpoint it came through, for the log only.
+async fn cancel_review(
+    state: &AppState,
+    key: &str,
+    force: bool,
+    how: &str,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let id = state
         .db
-        .resolve_patchset_id(&query.id)
+        .resolve_patchset_id(key)
         .await
         .map_err(|e| {
-            error!("Failed to resolve patchset {}: {}", query.id, e);
+            error!("Failed to resolve patchset {}: {}", key, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let cancelled = state
-        .db
-        .cancel_patchset(id, query.force)
-        .await
-        .map_err(|e| {
-            error!("Failed to cancel patchset {}: {}", id, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let cancelled = state.db.cancel_patchset(id, force).await.map_err(|e| {
+        error!("Failed to cancel patchset {}: {}", id, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if cancelled {
-        info!("Patchset {} cancelled (force={})", id, query.force);
+        info!("Patchset {} cancelled (force={}, via {})", id, force, how);
         Ok(Json(serde_json::json!({ "status": "cancelled", "id": id })))
     } else {
-        let reason = if query.force {
+        let reason = if force {
             "Patchset is not in a cancellable state (must be Pending, Incomplete, or In Review)"
         } else {
             "Patchset is not in a cancellable state (must be Pending or Incomplete; use force=true for In Review)"

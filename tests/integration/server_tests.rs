@@ -1186,6 +1186,119 @@ async fn test_token_priority_rejected_in_read_only_mode() {
     assert_eq!(stored_priority(&server.db, 3).await, 0);
 }
 
+async fn stored_status(db: &Arc<Database>, id: i64) -> String {
+    let mut rows = db
+        .conn
+        .query(
+            "SELECT status FROM patchsets WHERE id = ?",
+            libsql::params![id],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+// ── Token-authorized cancel ─────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn test_token_cancel_with_bearer_token() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 3).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/cancel-token?id=q2%40example.com",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["id"], 2);
+    assert_eq!(stored_status(&server.db, 2).await, "Cancelled");
+    assert_eq!(stored_status(&server.db, 1).await, "Pending");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_cancel_does_not_force_in_review() {
+    // The UI only offers the button on a pending patchset, so one claimed while
+    // the page was open must be refused, not have its review killed -- even
+    // when the request asks for force.
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 1).await;
+    server
+        .db
+        .conn
+        .execute("UPDATE patchsets SET status = 'In Review' WHERE id = 1", ())
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/cancel-token?id=1&force=true",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "not_modified");
+    assert_eq!(stored_status(&server.db, 1).await, "In Review");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_cancel_without_token_is_unauthorized() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 1).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/cancel-token?id=1",
+            server.base_url
+        ))
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(stored_status(&server.db, 1).await, "Pending");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_cancel_rejected_in_read_only_mode() {
+    let server = spawn_test_server_with_tokens(/* read_only */ true, &[BYPASS_TOKEN]).await;
+    seed_review_queue(&server.db, 1).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/cancel-token?id=1",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(stored_status(&server.db, 1).await, "Pending");
+}
+
 /// The patchset page is where the button lives, so the position it renders has
 /// to come back with the patchset.
 #[tokio::test]

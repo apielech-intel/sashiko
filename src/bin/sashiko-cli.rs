@@ -1421,7 +1421,10 @@ async fn handle_cancel(
             OutputFormat::Text => {
                 let status = result["status"].as_str().unwrap_or("");
                 if status == "cancelled" {
-                    let patchset = result["id"].as_i64().unwrap_or_default();
+                    // A daemon older than key resolution sends no id back.
+                    let patchset = result["id"]
+                        .as_i64()
+                        .map_or_else(|| id.clone(), |n| n.to_string());
                     print_colored(Color::Green, "Cancelled: ");
                     println!("Patchset {} has been cancelled.", patchset);
                 } else {

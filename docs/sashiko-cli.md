@@ -144,7 +144,9 @@ Cancel a pending review.
 sashiko-cli cancel [OPTIONS] <ID>
 ```
 
-`ID` is a numeric patchset ID.
+`ID` is a patchset ID, slug, or the message-ID of the cover letter or of any
+patch in the series -- the same keys `show` accepts. A message-ID copied from a
+lore URL may keep its `@` escaped as `%40`.
 
 **Options:**
 

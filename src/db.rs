@@ -108,6 +108,15 @@ pub struct Database {
     is_in_memory: bool,
     in_memory_transaction: tokio::sync::Mutex<()>,
     pub conn: libsql::Connection,
+    /// For the API's read-only queries.  A cursor left half-read on `conn`
+    /// holds a read snapshot there, and once another connection commits,
+    /// every write on `conn` fails at once with SQLITE_BUSY_SNAPSHOT until
+    /// the cursor is dropped.  Keeping the API's long reads on a connection
+    /// that never writes leaves `conn` free of them; readers on a separate
+    /// connection never get in a writer's way under WAL.  The same
+    /// connection as `conn` in memory, where a second one would be a
+    /// different database.
+    read_conn: libsql::Connection,
 }
 
 #[derive(Debug, Clone)]
@@ -482,7 +491,7 @@ impl Database {
     }
 
     pub async fn get_message_details(&self, id: i64) -> Result<Option<MessageRow>> {
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn.query(
             "SELECT m.id, m.message_id, m.thread_id, m.in_reply_to, m.author, m.subject, m.date, m.body, m.to_recipients, m.cc_recipients, m.git_blob_hash, m.mailing_list, p.diff, m.references_hdr 
              FROM messages m 
              LEFT JOIN patches p ON m.message_id = p.message_id
@@ -531,7 +540,7 @@ impl Database {
             // Fetch thread messages
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
-                let mut msg_rows = self.conn.query(
+                let mut msg_rows = self.read_conn.query(
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
@@ -580,7 +589,7 @@ impl Database {
 
     pub async fn get_message_details_by_msgid(&self, msg_id: &str) -> Result<Option<MessageRow>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT id FROM messages WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -609,7 +618,7 @@ impl Database {
     ) -> Result<Option<serde_json::Value>> {
         // 1. Try to find a patchset where this is the cover letter
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
                 libsql::params![msg_id],
@@ -624,7 +633,7 @@ impl Database {
 
         // 2. Fallback: Find a patchset that contains this message as a patch
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT patchset_id FROM patches WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -704,11 +713,24 @@ impl Database {
             .await;
         set_busy_timeout(&conn).await?;
 
+        let is_in_memory = settings.url == ":memory:";
+        let is_remote =
+            settings.url.starts_with("libsql://") || settings.url.starts_with("https://");
+        let read_conn = if is_in_memory || is_remote {
+            conn.clone()
+        } else {
+            let read_conn = db.connect()?;
+            set_busy_timeout(&read_conn).await?;
+            read_conn.execute("PRAGMA query_only = ON", ()).await?;
+            read_conn
+        };
+
         Ok(Self {
             database: db,
-            is_in_memory: settings.url == ":memory:",
+            is_in_memory,
             in_memory_transaction: tokio::sync::Mutex::new(()),
             conn,
+            read_conn,
         })
     }
 
@@ -1207,7 +1229,7 @@ impl Database {
 
     pub async fn get_mailing_lists(&self) -> Result<Vec<(String, String)>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query("SELECT name, nntp_group FROM mailing_lists", ())
             .await?;
         let mut lists = Vec::new();
@@ -1977,7 +1999,7 @@ impl Database {
     pub async fn get_json_decode_stats(&self) -> Result<serde_json::Value> {
         let mut daily = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch') AS day,
                         source, outcome, count(*)
@@ -2000,7 +2022,7 @@ impl Database {
 
         let mut by_source = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT source,
                         sum(CASE WHEN outcome = 'salvaged' THEN 1 ELSE 0 END),
@@ -2946,7 +2968,7 @@ impl Database {
     pub async fn get_model_experiment_stats(&self) -> Result<serde_json::Value> {
         let mut run_status = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT experiment_name, provider_id, model_id, status, count(*) FROM model_experiment_runs GROUP BY experiment_name, provider_id, model_id, status ORDER BY experiment_name, provider_id, model_id, status",
                 (),
@@ -2965,7 +2987,7 @@ impl Database {
 
         let mut confirmation_outcomes = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT confirmed_by, outcome, severity, count(*)
              FROM (
@@ -2992,7 +3014,7 @@ impl Database {
 
         let mut cohort_status = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT experiment_name, provider_id, model_id, selected, status, count(*) FROM model_experiment_sources GROUP BY experiment_name, provider_id, model_id, selected, status ORDER BY experiment_name, provider_id, model_id, selected, status",
                 (),
@@ -3011,7 +3033,7 @@ impl Database {
         drop(rows);
 
         let mut outcomes = Vec::new();
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn.query(
             "SELECT additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')), count(*) FROM model_experiment_findings WHERE COALESCE(preexisting, 0) = 0 GROUP BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')) ORDER BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome",
             (),
         ).await?;
@@ -3030,7 +3052,7 @@ impl Database {
         drop(rows);
 
         let mut paired_cost = Vec::new();
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn.query(
             "SELECT v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id, avg(m.tokens_in), avg(m.tokens_out), avg(m.tokens_cached), avg(v.tokens_in), avg(v.tokens_out), avg(v.tokens_cached), count(*), count(DISTINCT COALESCE(r.patch_id, -r.id)) FROM model_experiment_runs m JOIN model_experiment_runs v ON m.review_id = v.review_id AND m.stage = v.stage JOIN reviews r ON r.id = m.review_id WHERE m.experiment_name = 'main' AND v.experiment_name != 'main' AND m.status = 'completed' AND v.status = 'completed' GROUP BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id ORDER BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id",
             (),
         ).await?;
@@ -3046,7 +3068,7 @@ impl Database {
         drop(rows);
 
         let mut confirmation_cost = Vec::new();
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn.query(
             "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch'), provider_id, model_id, sum(tokens_in), sum(tokens_out), sum(tokens_cached) FROM model_confirmation_runs GROUP BY 1, provider_id, model_id ORDER BY 1, provider_id, model_id",
             (),
         ).await?;
@@ -3060,7 +3082,7 @@ impl Database {
         drop(rows);
 
         let mut confirmation_health = Vec::new();
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn.query(
             "SELECT model, provider_id, model_id, status, count(*), max(COALESCE(error, '')) FROM model_confirmation_runs GROUP BY model, provider_id, model_id, status ORDER BY model, provider_id, model_id, status",
             (),
         ).await?;
@@ -3082,7 +3104,7 @@ impl Database {
     pub async fn get_cross_review_stats(&self) -> Result<serde_json::Value> {
         let mut sources = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT j.source_name, j.local_provider,
                         j.local_model, COALESCE(j.remote_provider, ''),
@@ -3108,7 +3130,7 @@ impl Database {
         drop(rows);
         let mut outcomes = Vec::new();
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT j.source_name, j.local_provider,
                         j.local_model, COALESCE(j.remote_provider, ''),
@@ -3140,7 +3162,7 @@ impl Database {
 
     pub async fn get_cross_review_status(&self, patchset_id: i64) -> Result<serde_json::Value> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT cross_review_status, cross_reviewed_at
                  FROM patchsets WHERE id = ?",
@@ -3157,7 +3179,7 @@ impl Database {
         drop(rows);
 
         let mut source_rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT j.source_name, j.status, j.remote_model,
                         j.remote_provider
@@ -3280,7 +3302,7 @@ impl Database {
              JOIN messages_subsystems ms ON m.id = ms.message_id
              WHERE ms.subsystem_id = ?
              GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql_msgs, libsql::params![sid]).await?;
+            let mut rows = self.read_conn.query(sql_msgs, libsql::params![sid]).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let count: i64 = row.get(1)?;
@@ -3289,7 +3311,7 @@ impl Database {
             }
         } else {
             let sql_msgs = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, count(*) FROM messages GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql_msgs, ()).await?;
+            let mut rows = self.read_conn.query(sql_msgs, ()).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let count: i64 = row.get(1)?;
@@ -3304,7 +3326,7 @@ impl Database {
              JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
              WHERE ps.subsystem_id = ?
              GROUP BY day, status ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
+            let mut rows = self.read_conn.query(sql, libsql::params![sid]).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let status: Option<String> = row.get(1).ok();
@@ -3316,7 +3338,7 @@ impl Database {
             }
         } else {
             let sql = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, status, count(*) FROM patchsets GROUP BY day, status ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
+            let mut rows = self.read_conn.query(sql, ()).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let status: Option<String> = row.get(1).ok();
@@ -3337,7 +3359,7 @@ impl Database {
               JOIN patches_subsystems ps ON p.id = ps.patch_id
               WHERE ps.subsystem_id = ?
               GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
+            let mut rows = self.read_conn.query(sql, libsql::params![sid]).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let count: i64 = row.get(1)?;
@@ -3349,7 +3371,7 @@ impl Database {
                 "SELECT strftime('%Y-%m-%d', m.date, 'unixepoch') as day, count(*) FROM patches p
               JOIN messages m ON p.message_id = m.message_id
               GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
+            let mut rows = self.read_conn.query(sql, ()).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let count: i64 = row.get(1)?;
@@ -3370,7 +3392,7 @@ impl Database {
             WHERE ps.subsystem_id = ?
             GROUP BY day, status
             ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
+            let mut rows = self.read_conn.query(sql, libsql::params![sid]).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let status: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
@@ -3386,7 +3408,7 @@ impl Database {
             FROM reviews r
             GROUP BY day, status
             ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
+            let mut rows = self.read_conn.query(sql, ()).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let status: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
@@ -3415,7 +3437,7 @@ impl Database {
             WHERE ps.subsystem_id = ?
             GROUP BY day, severity
             ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
+            let mut rows = self.read_conn.query(sql, libsql::params![sid]).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let severity: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
@@ -3438,7 +3460,7 @@ impl Database {
             JOIN reviews r ON f.review_id = r.id
             GROUP BY day, severity
             ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
+            let mut rows = self.read_conn.query(sql, ()).await?;
             while let Ok(Some(row)) = rows.next().await {
                 if let Ok(day) = row.get::<String>(0) {
                     let severity: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
@@ -3536,8 +3558,8 @@ impl Database {
         );
         let mut findings_by_stage = Vec::new();
         let mut rows = match subsystem_id {
-            Some(sid) => self.conn.query(&sql, libsql::params![sid]).await?,
-            None => self.conn.query(&sql, ()).await?,
+            Some(sid) => self.read_conn.query(&sql, libsql::params![sid]).await?,
+            None => self.read_conn.query(&sql, ()).await?,
         };
         while let Ok(Some(row)) = rows.next().await {
             findings_by_stage.push(json!({
@@ -3627,8 +3649,8 @@ impl Database {
         let mut daily: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
         let mut rows_a = match subsystem_id {
-            Some(sid) => self.conn.query(&sql_a, libsql::params![sid]).await?,
-            None => self.conn.query(&sql_a, ()).await?,
+            Some(sid) => self.read_conn.query(&sql_a, libsql::params![sid]).await?,
+            None => self.read_conn.query(&sql_a, ()).await?,
         };
         while let Ok(Some(row)) = rows_a.next().await {
             let Ok(day) = row.get::<String>(0) else {
@@ -3783,11 +3805,11 @@ impl Database {
         );
         let mut rows_b = match subsystem_id {
             Some(sid) => {
-                self.conn
+                self.read_conn
                     .query(&sql_b, libsql::params![sid, sid, sid, sid])
                     .await?
             }
-            None => self.conn.query(&sql_b, ()).await?,
+            None => self.read_conn.query(&sql_b, ()).await?,
         };
         while let Ok(Some(row)) = rows_b.next().await {
             let Ok(day) = row.get::<String>(0) else {
@@ -3837,7 +3859,7 @@ impl Database {
 
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
         let mut total_rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review')",
                 (),
@@ -3850,7 +3872,7 @@ impl Database {
         };
 
         let mut failed_rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review') AND (lower(status) LIKE '%failed%' OR lower(status) LIKE '%error%')",
                 (),
@@ -3877,7 +3899,7 @@ impl Database {
         LEFT JOIN ai_interactions ai INDEXED BY idx_ai_interactions_tokens ON r.interaction_id = ai.id
         GROUP BY r.provider, r.model, r.status";
 
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.read_conn.query(sql, ()).await?;
         let mut stats = Vec::new();
         #[allow(clippy::similar_names)]
         while let Ok(Some(row)) = rows.next().await {
@@ -3915,7 +3937,7 @@ impl Database {
                    FROM tool_usages tu \
                    JOIN last_reviews r ON tu.review_id = r.id \
                    GROUP BY tu.provider, tu.model, tu.tool_name";
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.read_conn.query(sql, ()).await?;
         let mut stats = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let provider: Option<String> = row.get(0).ok();
@@ -5369,7 +5391,7 @@ impl Database {
         args.push(libsql::Value::Integer(limit as i64));
         args.push(libsql::Value::Integer(offset as i64));
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn.query(&sql, args).await?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -5500,7 +5522,7 @@ impl Database {
         args.push(libsql::Value::Integer(limit as i64));
         args.push(libsql::Value::Integer(offset as i64));
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn.query(&sql, args).await?;
         let mut messages = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             messages.push(MessageRow {
@@ -5538,7 +5560,7 @@ impl Database {
             args.push(libsql::Value::Text(p));
         }
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn.query(&sql, args).await?;
         if let Ok(Some(row)) = rows.next().await {
             let count: i64 = row.get(0)?;
             Ok(count as usize)
@@ -5588,7 +5610,7 @@ impl Database {
             args.push(libsql::Value::Text(p));
         }
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn.query(&sql, args).await?;
         if let Ok(Some(row)) = rows.next().await {
             let count: i64 = row.get(0)?;
             Ok(count as usize)
@@ -5605,7 +5627,7 @@ impl Database {
         bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
@@ -5642,7 +5664,7 @@ impl Database {
             // Fetch baseline details if needed
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
-                    .conn
+                    .read_conn
                     .query(
                         "SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?",
                         libsql::params![bid],
@@ -5669,7 +5691,7 @@ impl Database {
             // Fetch subsystems
             let mut subsystems = Vec::new();
             let mut sub_rows = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT s.name FROM subsystems s
                  JOIN patchsets_subsystems ps ON s.id = ps.subsystem_id
@@ -5683,7 +5705,7 @@ impl Database {
 
             let mut total_patches = 0;
             let mut count_rows = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
                     libsql::params![pid],
@@ -5703,7 +5725,7 @@ impl Database {
             let mut patches = Vec::new();
             let mut patch_ids = Vec::new();
             let mut patch_rows = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT p.id, p.message_id, p.part_index, m.id, m.subject, p.status, p.apply_error, 
                             eo.status as email_status, eo.to_addresses, eo.cc_addresses
@@ -5744,9 +5766,11 @@ impl Database {
             if in_clause.is_empty() {
                 in_clause = "-1".to_string(); // Fallback so SQL doesn't error
             }
+            // No r.logs: every review's full log, often MBs, for a page that
+            // never shows it; the log view reads it from get_review_details.
             let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags,
+                "SELECT r.summary, r.created_at, ai.output_raw,
+                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags,
                         r.semcode_status
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
@@ -5758,24 +5782,23 @@ impl Database {
                 params.push(libsql::Value::Integer(pid_val));
             }
 
-            let mut rev_rows = self.conn.query(&query_str, params).await?;
+            let mut rev_rows = self.read_conn.query(&query_str, params).await?;
 
             while let Ok(Some(r)) = rev_rows.next().await {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(3).ok(),
-                    "result": r.get::<Option<String>>(4).ok(),
-                    "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": r.get::<Option<String>>(6).ok(),
-                    "logs": r.get::<Option<String>>(7).ok(),
-                    "tokens_in": r.get::<Option<u32>>(8).ok(),
-                    "tokens_out": r.get::<Option<u32>>(9).ok(),
-                    "patch_id": r.get::<Option<i64>>(10).ok(),
-                    "id": r.get::<i64>(11).ok(),
-                    "tokens_cached": r.get::<Option<u32>>(12).ok(),
-                    "budget_flags": r.get::<Option<i64>>(13).ok().flatten().unwrap_or(0),
-                    "semcode_status": r.get::<Option<String>>(14).ok().flatten(),
+                    "output": r.get::<Option<String>>(2).ok(),
+                    "result": r.get::<Option<String>>(3).ok(),
+                    "status": r.get::<Option<String>>(4).ok(),
+                    "inline_review": r.get::<Option<String>>(5).ok(),
+                    "tokens_in": r.get::<Option<u32>>(6).ok(),
+                    "tokens_out": r.get::<Option<u32>>(7).ok(),
+                    "patch_id": r.get::<Option<i64>>(8).ok(),
+                    "id": r.get::<i64>(9).ok(),
+                    "tokens_cached": r.get::<Option<u32>>(10).ok(),
+                    "budget_flags": r.get::<Option<i64>>(11).ok().flatten().unwrap_or(0),
+                    "semcode_status": r.get::<Option<String>>(12).ok().flatten(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -5786,7 +5809,7 @@ impl Database {
             // Fetch thread messages
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
-                let mut msg_rows = self.conn.query(
+                let mut msg_rows = self.read_conn.query(
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
@@ -5865,7 +5888,7 @@ impl Database {
         bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
@@ -5902,7 +5925,7 @@ impl Database {
             let priority: i64 = row.get(20).unwrap_or(0);
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
-                    .conn
+                    .read_conn
                     .query(
                         "SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?",
                         libsql::params![bid],
@@ -5927,7 +5950,7 @@ impl Database {
 
             let mut subsystems = Vec::new();
             let mut sub_rows = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT s.name FROM subsystems s
                  JOIN patchsets_subsystems ps ON s.id = ps.subsystem_id
@@ -5941,7 +5964,7 @@ impl Database {
 
             let mut total_patches = 0;
             let mut count_rows = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
                     libsql::params![pid],
@@ -5960,7 +5983,7 @@ impl Database {
             let mut patches = Vec::new();
             let mut patch_ids = Vec::new();
             let mut patch_rows = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT p.id, p.message_id, p.part_index, m.id, m.subject, p.status, p.apply_error, 
                             eo.status as email_status, eo.to_addresses, eo.cc_addresses
@@ -6015,7 +6038,7 @@ impl Database {
                 params.push(libsql::Value::Integer(pid_val));
             }
 
-            let mut rev_rows = self.conn.query(&query_str, params).await?;
+            let mut rev_rows = self.read_conn.query(&query_str, params).await?;
 
             while let Ok(Some(r)) = rev_rows.next().await {
                 reviews.push(serde_json::json!({
@@ -6041,7 +6064,7 @@ impl Database {
 
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
-                let mut msg_rows = self.conn.query(
+                let mut msg_rows = self.read_conn.query(
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
@@ -6136,7 +6159,7 @@ impl Database {
         bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
                 libsql::params![msg_id],
@@ -6150,7 +6173,7 @@ impl Database {
         }
 
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT patchset_id FROM patches WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -6174,7 +6197,7 @@ impl Database {
         bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT id FROM patchsets WHERE slug = ?",
                 libsql::params![slug],
@@ -6220,7 +6243,7 @@ impl Database {
         bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
@@ -6285,7 +6308,7 @@ impl Database {
         bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT id FROM reviews WHERE patchset_id = ? ORDER BY created_at DESC LIMIT 1",
                 libsql::params![patchset_id],
@@ -6915,7 +6938,7 @@ impl Database {
     /// SQLite's `date ASC` puts a NULL.
     async fn pending_queue_position(&self, id: i64) -> Result<(usize, usize)> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT
                    (SELECT COUNT(*) FROM patchsets q
@@ -6932,7 +6955,7 @@ impl Database {
             .await?;
         let Some(row) = rows.next().await? else {
             let mut totals = self
-                .conn
+                .read_conn
                 .query(
                     "SELECT COUNT(*) FROM patchsets WHERE status = 'Pending'",
                     (),
@@ -7947,7 +7970,7 @@ impl Database {
             GROUP BY day, outcome, unit
             ORDER BY 1, 2";
 
-        let mut rows = self.conn.query(sql, libsql::params![cutoff]).await?;
+        let mut rows = self.read_conn.query(sql, libsql::params![cutoff]).await?;
         let mut daily = Vec::new();
         while let Some(row) = rows.next().await? {
             daily.push(json!({
@@ -8154,7 +8177,7 @@ impl Database {
             GROUP BY us.experiment, us.outcome
             ORDER BY us.experiment, us.outcome";
 
-        let mut rows = self.conn.query(sql, libsql::params![cutoff]).await?;
+        let mut rows = self.read_conn.query(sql, libsql::params![cutoff]).await?;
         let mut models = Vec::new();
         while let Some(row) = rows.next().await? {
             models.push(json!({
@@ -8180,7 +8203,7 @@ impl Database {
     /// have ingested, which the poller feeds back to patchwork as `since`.
     pub async fn get_patchwork_sync(&self) -> Result<serde_json::Value> {
         let mut rows = self
-            .conn
+            .read_conn
             .query(
                 "SELECT last_event_date, last_event_id, updated_at
                  FROM patchwork_sync WHERE id = 1",
@@ -8255,6 +8278,74 @@ mod tests {
         db.create_review(1, None, "p", "m", None, None)
             .await
             .unwrap();
+    }
+
+    /// The same interleaving with the cursor on `read_conn`, where the API's
+    /// reads now run, leaves writes on `conn` alone.
+    #[tokio::test]
+    async fn open_read_conn_cursor_does_not_block_shared_connection_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("snapshot.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db.conn
+            .execute("INSERT INTO patchsets (id) VALUES (1), (2)", ())
+            .await
+            .unwrap();
+
+        let mut cursor = db
+            .read_conn
+            .query("SELECT id FROM patchsets", ())
+            .await
+            .unwrap();
+        cursor.next().await.unwrap().unwrap();
+        db.database
+            .connect()
+            .unwrap()
+            .execute("INSERT INTO patchsets (id) VALUES (3)", ())
+            .await
+            .unwrap();
+
+        db.create_review(1, None, "p", "m", None, None)
+            .await
+            .unwrap();
+        drop(cursor);
+
+        let error = db
+            .read_conn
+            .execute("INSERT INTO patchsets (id) VALUES (4)", ())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("readonly"),
+            "read_conn accepted a write: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patchset_details_leave_out_review_logs() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patchsets (id, status) VALUES (1, 'Reviewed');
+                 INSERT INTO reviews (patchset_id, status, logs, inline_review)
+                     VALUES (1, 'Reviewed', '[\"a very long log\"]', 'inline');",
+            )
+            .await
+            .unwrap();
+
+        let details = db
+            .get_patchset_details(1, None, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let review = &details["reviews"][0];
+        assert_eq!(review["inline_review"], "inline");
+        assert_eq!(review["status"], "Reviewed");
+        assert!(review.get("logs").is_none(), "details carry logs: {review}");
     }
 
     #[tokio::test]

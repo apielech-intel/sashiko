@@ -20,6 +20,89 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
+/// How long a connection waits for another writer before failing with
+/// `database is locked`.  This only covers real contention: a write on a
+/// connection whose open cursor holds a stale snapshot fails at once with
+/// SQLITE_BUSY_SNAPSHOT, whatever this is set to.
+const BUSY_TIMEOUT_MS: u64 = 30_000;
+
+/// Writes slower than this, and write transactions held longer than this,
+/// are logged so a `database is locked` failure can be traced to its holder.
+const SLOW_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn set_busy_timeout(conn: &libsql::Connection) -> Result<()> {
+    let _ = conn
+        .query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
+        .await?
+        .next()
+        .await;
+    Ok(())
+}
+
+/// Logs on drop if the write transaction it was started with ran past
+/// `SLOW_WRITE`; everyone else's writes wait on it for that long.
+struct WriteLockTimer {
+    what: &'static str,
+    started: std::time::Instant,
+}
+
+impl WriteLockTimer {
+    fn start(what: &'static str) -> Self {
+        Self {
+            what,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for WriteLockTimer {
+    fn drop(&mut self) {
+        let held = self.started.elapsed();
+        if held > SLOW_WRITE {
+            warn!(
+                "DB lock: {} held the write lock for {:.1}s",
+                self.what,
+                held.as_secs_f64()
+            );
+        }
+    }
+}
+
+/// Times one write and logs it when slow or when it fails on a lock, with
+/// the extended SQLite code that `database is locked` alone does not show.
+async fn timed_write<T>(
+    what: &'static str,
+    write: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    let result = write.await;
+    let took = started.elapsed().as_secs_f64();
+    match &result {
+        Err(error) => {
+            if let Some(libsql::Error::SqliteFailure(code, _)) = error.downcast_ref() {
+                let kind = match *code {
+                    5 => "SQLITE_BUSY: another writer held the lock",
+                    517 => {
+                        "SQLITE_BUSY_SNAPSHOT: this connection's open cursor is on a stale snapshot"
+                    }
+                    261 => "SQLITE_BUSY_RECOVERY",
+                    773 => "SQLITE_BUSY_TIMEOUT",
+                    6 | 262 => "SQLITE_LOCKED: conflict within this connection",
+                    _ => "",
+                };
+                if !kind.is_empty() {
+                    warn!("DB lock: {what} failed after {took:.3}s with code {code} ({kind})");
+                }
+            }
+        }
+        Ok(_) if took > SLOW_WRITE.as_secs_f64() => {
+            warn!("DB lock: {what} took {took:.1}s");
+        }
+        Ok(_) => {}
+    }
+    result
+}
+
 pub struct Database {
     database: libsql::Database,
     is_in_memory: bool,
@@ -619,11 +702,7 @@ impl Database {
             .await?
             .next()
             .await;
-        let _ = conn
-            .query("PRAGMA busy_timeout = 5000;", ())
-            .await?
-            .next()
-            .await;
+        set_busy_timeout(&conn).await?;
 
         Ok(Self {
             database: db,
@@ -1169,22 +1248,21 @@ impl Database {
             return Ok(None);
         };
         let review_id: i64 = row.get(0)?;
+        drop(rows);
 
-        self.conn
-            .execute(
-                "UPDATE reviews SET provider = ?, model = ?, baseline_id = ?, prompts_hash = ?, created_at = ? WHERE id = ?",
-                libsql::params![
-                    provider,
-                    model,
-                    baseline_id,
-                    prompts_hash,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64,
-                    review_id
-                ],
-            )
-            .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        timed_write("take_pending_review", async {
+            self.conn
+                .execute(
+                    "UPDATE reviews SET provider = ?, model = ?, baseline_id = ?, prompts_hash = ?, created_at = ? WHERE id = ?",
+                    libsql::params![provider, model, baseline_id, prompts_hash, now, review_id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         Ok(Some(review_id))
     }
@@ -1198,30 +1276,27 @@ impl Database {
         baseline_id: Option<i64>,
         prompts_hash: Option<&str>,
     ) -> Result<i64> {
-        let mut rows = self
-            .conn
-            .query(
-                "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
-             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![
-                    patchset_id,
-                    patch_id,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64,
-                    provider,
-                    model,
-                    baseline_id,
-                    prompts_hash
-                ],
-            )
-            .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        timed_write("create_review", async {
+            let mut rows = self
+                .conn
+                .query(
+                    "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
+                 VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
+                    libsql::params![patchset_id, patch_id, now, provider, model, baseline_id, prompts_hash],
+                )
+                .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to get review ID"))
-        }
+            // The INSERT runs on the first step, so a lock error surfaces
+            // here; don't let it pass as a missing row.
+            match rows.next().await? {
+                Some(row) => Ok(row.get(0)?),
+                None => Err(anyhow::anyhow!("Failed to get review ID")),
+            }
+        })
+        .await
     }
 
     pub async fn has_successful_review(
@@ -1279,22 +1354,25 @@ impl Database {
         status: &str,
         logs: Option<&str>,
     ) -> Result<()> {
-        if let Some(l) = logs {
-            self.conn
-                .execute(
-                    "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                    libsql::params![status, l, review_id],
-                )
-                .await?;
-        } else {
-            self.conn
-                .execute(
-                    "UPDATE reviews SET status = ? WHERE id = ?",
-                    libsql::params![status, review_id],
-                )
-                .await?;
-        }
-        Ok(())
+        timed_write("update_review_status", async {
+            if let Some(l) = logs {
+                self.conn
+                    .execute(
+                        "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
+                        libsql::params![status, l, review_id],
+                    )
+                    .await?;
+            } else {
+                self.conn
+                    .execute(
+                        "UPDATE reviews SET status = ? WHERE id = ?",
+                        libsql::params![status, review_id],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1312,13 +1390,16 @@ impl Database {
         let completed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
-        self.conn
-            .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?, budget_flags = ?, completed_at = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, budget_flags.unwrap_or(0) as i64, completed_at, review_id],
-            )
-            .await?;
-        Ok(())
+        timed_write("complete_review", async {
+            self.conn
+                .execute(
+                    "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?, budget_flags = ?, completed_at = ? WHERE id = ?",
+                    libsql::params![status, result, summary, interaction_id, inline_review, logs, budget_flags.unwrap_or(0) as i64, completed_at, review_id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn update_review_dedup_stats(
@@ -1328,26 +1409,32 @@ impl Database {
         unique: i64,
         multi_stage: i64,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE reviews SET concerns_total = ?, concerns_unique = ?, findings_multi_stage = ? WHERE id = ?",
-                libsql::params![total, unique, multi_stage, review_id],
-            )
-            .await?;
-        Ok(())
+        timed_write("update_review_dedup_stats", async {
+            self.conn
+                .execute(
+                    "UPDATE reviews SET concerns_total = ?, concerns_unique = ?, findings_multi_stage = ? WHERE id = ?",
+                    libsql::params![total, unique, multi_stage, review_id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Record whether the review had semcode available: "ok", "setup_failed" or
     /// "disabled".  A review that ran without it is not wrong, just blinder, so
     /// this is kept out of `complete_review` and written separately.
     pub async fn update_review_semcode_status(&self, review_id: i64, status: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE reviews SET semcode_status = ? WHERE id = ?",
-                libsql::params![status, review_id],
-            )
-            .await?;
-        Ok(())
+        timed_write("update_review_semcode_status", async {
+            self.conn
+                .execute(
+                    "UPDATE reviews SET semcode_status = ? WHERE id = ?",
+                    libsql::params![status, review_id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Creates one job per configured peer for a finished local review and
@@ -1388,14 +1475,11 @@ impl Database {
             };
         }
         let connection = self.database.connect()?;
-        let _ = connection
-            .query("PRAGMA busy_timeout = 5000", ())
-            .await?
-            .next()
-            .await;
+        set_busy_timeout(&connection).await?;
         let transaction = connection
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
+        let _lock_timer = WriteLockTimer::start("enqueue_cross_reviews");
         let result = self
             .enqueue_cross_reviews_on(&transaction, patchset_id, instances, now)
             .await;
@@ -2114,14 +2198,11 @@ impl Database {
             };
         }
         let connection = self.database.connect()?;
-        let _ = connection
-            .query("PRAGMA busy_timeout = 5000", ())
-            .await?
-            .next()
-            .await;
+        set_busy_timeout(&connection).await?;
         let transaction = connection
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
+        let _lock_timer = WriteLockTimer::start("persist_cross_review_result");
         let result = self
             .persist_cross_review_records(&transaction, job, remote, analysis, rendered, usage, now)
             .await;
@@ -2558,14 +2639,11 @@ impl Database {
             };
         }
         let connection = self.database.connect()?;
-        let _ = connection
-            .query("PRAGMA busy_timeout = 5000", ())
-            .await?
-            .next()
-            .await;
+        set_busy_timeout(&connection).await?;
         let transaction = connection
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
+        let _lock_timer = WriteLockTimer::start("save_model_experiment");
         let result = self
             .save_model_experiment_records(&transaction, review_id, experiment, findings)
             .await;
@@ -7626,6 +7704,7 @@ impl Database {
         let mut unknown_states: std::collections::BTreeSet<String> = Default::default();
 
         self.begin_transaction().await?;
+        let _lock_timer = WriteLockTimer::start("record_patchwork_states");
 
         for record in records {
             let msgid = record
@@ -8133,6 +8212,49 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    /// The `database is locked` that aborted whole series: a write on the
+    /// shared connection while one of its cursors is half-read fails at once
+    /// if another connection has committed meanwhile, busy timeout or not.
+    #[tokio::test]
+    async fn open_cursor_makes_shared_connection_write_fail_with_busy_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("snapshot.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db.conn
+            .execute("INSERT INTO patchsets (id) VALUES (1), (2)", ())
+            .await
+            .unwrap();
+
+        let mut cursor = db.conn.query("SELECT id FROM patchsets", ()).await.unwrap();
+        cursor.next().await.unwrap().unwrap();
+        db.database
+            .connect()
+            .unwrap()
+            .execute("INSERT INTO patchsets (id) VALUES (3)", ())
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = db
+            .create_review(1, None, "p", "m", None, None)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        match error.downcast_ref::<libsql::Error>() {
+            Some(libsql::Error::SqliteFailure(code, _)) => assert_eq!(*code, 517),
+            other => panic!("expected SQLITE_BUSY_SNAPSHOT, got {other:?} ({error:#})"),
+        }
+
+        drop(cursor);
+        db.create_review(1, None, "p", "m", None, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

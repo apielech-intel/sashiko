@@ -207,11 +207,19 @@ pub struct BedrockSettings {
     /// Effort level used for retries and after the review budget warning.
     #[serde(default)]
     pub retry_effort: Option<String>,
+    /// Send inferenceConfig.temperature. Disable for models that reject it (e.g. GPT reasoning models).
+    #[serde(default = "default_send_temperature")]
+    pub send_temperature: bool,
 }
 
 #[cfg(feature = "bedrock")]
 fn default_bedrock_max_tokens() -> u32 {
     8192
+}
+
+#[cfg(feature = "bedrock")]
+fn default_send_temperature() -> bool {
+    true
 }
 
 fn default_prompt_caching() -> bool {

@@ -139,6 +139,7 @@ pub struct BedrockClient {
     max_tokens: u32,
     thinking: Option<String>,
     effort: Option<String>,
+    send_temperature: bool,
 }
 
 impl BedrockClient {
@@ -165,7 +166,13 @@ impl BedrockClient {
             max_tokens,
             thinking,
             effort,
+            send_temperature: true,
         }
+    }
+
+    pub fn with_send_temperature(mut self, send_temperature: bool) -> Self {
+        self.send_temperature = send_temperature;
+        self
     }
 
     async fn get_client(&self) -> &Client {
@@ -586,7 +593,10 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
 
 #[async_trait]
 impl AiProvider for BedrockClient {
-    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+    async fn generate_content(&self, mut request: AiRequest) -> Result<AiResponse> {
+        if !self.send_temperature {
+            request.temperature = None;
+        }
         let params = translate_request(
             &request,
             self.enable_caching,

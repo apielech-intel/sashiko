@@ -531,14 +531,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let max_tokens = bedrock.map(|b| b.max_tokens).unwrap_or(8192);
             let thinking = bedrock.and_then(|b| b.thinking.clone());
             let effort = bedrock.and_then(|b| b.effort.clone());
-            Ok(Arc::new(bedrock::BedrockClient::new(
-                model,
-                region,
-                enable_caching,
-                max_tokens,
-                thinking,
-                effort,
-            )))
+            let send_temperature = bedrock.map(|b| b.send_temperature).unwrap_or(true);
+            Ok(Arc::new(
+                bedrock::BedrockClient::new(
+                    model,
+                    region,
+                    enable_caching,
+                    max_tokens,
+                    thinking,
+                    effort,
+                )
+                .with_send_temperature(send_temperature),
+            ))
         }
         #[cfg(not(feature = "bedrock"))]
         "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),

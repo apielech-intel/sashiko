@@ -171,6 +171,12 @@ cp docs/examples/Settings.claude-bedrock.toml Settings.toml
 - Cross-region inference profiles (e.g. `us.anthropic.claude-*`)
 - Full tool/function calling support
 
+**Non-Claude models:** `prompt_caching`, `thinking`, `effort` and
+`retry_effort` under `[ai.bedrock]` are Anthropic-specific; set
+`prompt_caching = false` and leave the others unset. Models that reject
+the temperature field (e.g. GPT reasoning models) also need
+`send_temperature = false`.
+
 ## Google Cloud Vertex AI
 
 Uses Claude models (and potentially others) via Google Cloud

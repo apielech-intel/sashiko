@@ -33,6 +33,8 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
+#[cfg(feature = "bedrock")]
+use std::time::Instant;
 use url::Url;
 
 const PROVIDER_TAG: &str = "openai-responses";
@@ -125,10 +127,17 @@ pub struct OpenAiResponsesClient {
     reasoning_effort: Option<String>,
     prompt_cache: Option<crate::settings::PromptCacheMode>,
     prompt_cache_ttl: Option<String>,
-    #[allow(dead_code)]
     bedrock_token: bool,
+    #[cfg(feature = "bedrock")]
+    token_region: Option<String>,
+    #[cfg(feature = "bedrock")]
+    token_cache: tokio::sync::Mutex<Option<(String, Instant)>>,
     client: Client,
 }
+
+/// Bedrock API keys last up to 12 h; refresh well before that.
+#[cfg(feature = "bedrock")]
+const TOKEN_REFRESH_AFTER: Duration = Duration::from_secs(11 * 3600);
 
 impl OpenAiResponsesClient {
     pub fn new(
@@ -146,25 +155,51 @@ impl OpenAiResponsesClient {
             prompt_cache_ttl,
             bedrock_token,
         } = options;
-        let api_key =
-            Self::resolve_api_key(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
+        #[cfg(not(feature = "bedrock"))]
+        if bedrock_token {
+            return Err(anyhow!("bedrock_token requires the 'bedrock' feature"));
+        }
 
         let endpoint = Self::normalize_base_url(&base_url)?;
 
-        // Naming the variable rather than the key means a typo in `api_key_env`
-        // is silently ignored and falls back to the shared key, so record which
-        // variable actually authenticated this provider.
-        tracing::info!(
-            "OpenAI Responses provider for {model} authenticating with {}",
-            api_key_env
-                .as_deref()
-                .unwrap_or("OPENAI_API_KEY/LLM_API_KEY")
-        );
+        #[cfg(feature = "bedrock")]
+        let token_region = if bedrock_token {
+            Some(
+                crate::ai::bedrock_token::region_from_base_url(&endpoint)
+                    .or_else(|| std::env::var("AWS_REGION").ok().filter(|r| !r.is_empty()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "bedrock_token: cannot determine the AWS region from {base_url}; set AWS_REGION"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let mut headers = reqwest::header::HeaderMap::new();
-        if !api_key.is_empty() {
-            let (name, value) = Self::auth_header(&endpoint, &api_key)?;
-            headers.insert(name, value);
+        if bedrock_token {
+            tracing::info!(
+                "OpenAI Responses provider for {model} authenticating with a short-term Amazon Bedrock API key"
+            );
+        } else {
+            let api_key =
+                Self::resolve_api_key(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
+
+            // Naming the variable rather than the key means a typo in `api_key_env`
+            // is silently ignored and falls back to the shared key, so record which
+            // variable actually authenticated this provider.
+            tracing::info!(
+                "OpenAI Responses provider for {model} authenticating with {}",
+                api_key_env
+                    .as_deref()
+                    .unwrap_or("OPENAI_API_KEY/LLM_API_KEY")
+            );
+
+            if !api_key.is_empty() {
+                let (name, value) = Self::auth_header(&endpoint, &api_key)?;
+                headers.insert(name, value);
+            }
         }
 
         let client = Client::builder()
@@ -181,6 +216,10 @@ impl OpenAiResponsesClient {
             prompt_cache,
             prompt_cache_ttl,
             bedrock_token,
+            #[cfg(feature = "bedrock")]
+            token_region,
+            #[cfg(feature = "bedrock")]
+            token_cache: tokio::sync::Mutex::new(None),
             client,
         })
     }
@@ -271,9 +310,40 @@ impl OpenAiResponsesClient {
             .is_some_and(|host| host.ends_with(".azure-api.net"))
     }
 
+    #[cfg(feature = "bedrock")]
+    async fn bedrock_bearer_token(&self) -> Result<String> {
+        let mut cache = self.token_cache.lock().await;
+        if let Some((token, created)) = cache.as_ref()
+            && created.elapsed() < TOKEN_REFRESH_AFTER
+        {
+            return Ok(token.clone());
+        }
+        let region = self
+            .token_region
+            .as_deref()
+            .ok_or_else(|| anyhow!("no region resolved for the Bedrock API key"))?;
+        let token = crate::ai::bedrock_token::generate_token(region).await?;
+        *cache = Some((token.clone(), Instant::now()));
+        Ok(token)
+    }
+
+    #[cfg(not(feature = "bedrock"))]
+    async fn bedrock_bearer_token(&self) -> Result<String> {
+        Err(anyhow!("bedrock_token requires the 'bedrock' feature"))
+    }
+
     async fn post_request(&self, body: &ResponsesRequest) -> Result<ResponsesResponse> {
         let retry_re = Regex::new(r"Please retry in ([0-9.]+)s").expect("valid retry regex");
-        let response = self.client.post(&self.endpoint).json(body).send().await;
+        let mut request = self.client.post(&self.endpoint).json(body);
+        if self.bedrock_token {
+            let token = self.bedrock_bearer_token().await.map_err(|error| {
+                OpenAiCompatError::AuthenticationError(format!(
+                    "failed to create Amazon Bedrock API key: {error:#}"
+                ))
+            })?;
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -971,6 +1041,49 @@ mod tests {
         assert_eq!(name, reqwest::header::AUTHORIZATION);
         assert_eq!(value.to_str()?, "Bearer sk-token");
         Ok(())
+    }
+
+    fn bedrock_token_options() -> ResponsesOptions {
+        ResponsesOptions {
+            bedrock_token: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "bedrock")]
+    #[test]
+    fn bedrock_token_needs_no_static_api_key() {
+        // Region comes from the URL, so neither API-key nor AWS env is read.
+        let client = OpenAiResponsesClient::new(
+            "https://bedrock-mantle.eu-north-1.api.aws/v1".to_string(),
+            "model".to_string(),
+            1000,
+            100,
+            30,
+            bedrock_token_options(),
+        )
+        .expect("client without API key");
+        assert!(client.bedrock_token);
+        assert_eq!(client.token_region.as_deref(), Some("eu-north-1"));
+    }
+
+    #[cfg(not(feature = "bedrock"))]
+    #[test]
+    fn bedrock_token_requires_bedrock_feature() {
+        let error = OpenAiResponsesClient::new(
+            "https://bedrock-mantle.eu-north-1.api.aws/v1".to_string(),
+            "model".to_string(),
+            1000,
+            100,
+            30,
+            bedrock_token_options(),
+        )
+        .err()
+        .expect("must fail without the bedrock feature");
+        assert_eq!(
+            error.to_string(),
+            "bedrock_token requires the 'bedrock' feature"
+        );
     }
 
     #[test]

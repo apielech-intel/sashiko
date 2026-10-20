@@ -727,6 +727,8 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
 }
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+#[cfg(feature = "bedrock")]
+pub(crate) mod bedrock_token;
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;

@@ -276,6 +276,31 @@ pub struct OpenAiCompatSettings {
     /// providers always use the fallback variables.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Bedrock `prompt_cache_options.mode`; markers are added when set (Responses only).
+    #[serde(default)]
+    pub prompt_cache: Option<PromptCacheMode>,
+    /// Sent as `prompt_cache_options.ttl`.
+    #[serde(default)]
+    pub prompt_cache_ttl: Option<String>,
+    /// Authenticate with a short-term Amazon Bedrock API key built from the AWS credential chain.
+    #[serde(default)]
+    pub bedrock_token: bool,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheMode {
+    Implicit,
+    Explicit,
+}
+
+impl PromptCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::Explicit => "explicit",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1291,6 +1316,56 @@ mod tests {
                 .and_then(|openai| openai.base_url.as_deref()),
             Some("https://gateway-two.azure-api.net/openai/responses")
         );
+    }
+
+    #[test]
+    fn openai_compat_parses_prompt_cache_and_bedrock_token() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            ai: AiSettings,
+        }
+
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+                [ai]
+                provider = "openai-responses"
+                model = "gpt-5.6"
+
+                [ai.openai_compat]
+                prompt_cache = "explicit"
+                prompt_cache_ttl = "30m"
+                bedrock_token = true
+            "#,
+        )
+        .unwrap();
+        let openai = wrapper.ai.openai_compat.unwrap();
+
+        assert_eq!(openai.prompt_cache, Some(PromptCacheMode::Explicit));
+        assert_eq!(openai.prompt_cache.unwrap().as_str(), "explicit");
+        assert_eq!(openai.prompt_cache_ttl.as_deref(), Some("30m"));
+        assert!(openai.bedrock_token);
+    }
+
+    #[test]
+    fn openai_compat_rejects_unknown_prompt_cache_mode() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[allow(dead_code)]
+            ai: AiSettings,
+        }
+
+        let result = toml::from_str::<Wrapper>(
+            r#"
+                [ai]
+                provider = "openai-responses"
+                model = "gpt-5.6"
+
+                [ai.openai_compat]
+                prompt_cache = "bogus"
+            "#,
+        );
+
+        assert!(result.is_err());
     }
 
     /// Ranking has to stay off unless a deployment asks for it: the flag costs a

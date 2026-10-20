@@ -104,12 +104,27 @@ struct ResponsesApiError {
     message: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ResponsesOptions {
+    pub reasoning_effort: Option<String>,
+    pub api_key_env: Option<String>,
+    pub prompt_cache: Option<crate::settings::PromptCacheMode>,
+    pub prompt_cache_ttl: Option<String>,
+    pub bedrock_token: bool,
+}
+
 pub struct OpenAiResponsesClient {
     model: String,
     endpoint: String,
     context_window_size: usize,
     max_tokens: u32,
     reasoning_effort: Option<String>,
+    #[allow(dead_code)]
+    prompt_cache: Option<crate::settings::PromptCacheMode>,
+    #[allow(dead_code)]
+    prompt_cache_ttl: Option<String>,
+    #[allow(dead_code)]
+    bedrock_token: bool,
     client: Client,
 }
 
@@ -120,9 +135,15 @@ impl OpenAiResponsesClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
-        reasoning_effort: Option<String>,
-        api_key_env: Option<String>,
+        options: ResponsesOptions,
     ) -> Result<Self> {
+        let ResponsesOptions {
+            reasoning_effort,
+            api_key_env,
+            prompt_cache,
+            prompt_cache_ttl,
+            bedrock_token,
+        } = options;
         let api_key =
             Self::resolve_api_key(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
 
@@ -155,6 +176,9 @@ impl OpenAiResponsesClient {
             context_window_size,
             max_tokens,
             reasoning_effort,
+            prompt_cache,
+            prompt_cache_ttl,
+            bedrock_token,
             client,
         })
     }

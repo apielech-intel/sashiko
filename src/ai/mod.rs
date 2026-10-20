@@ -608,8 +608,13 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let max_tokens = cfg
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(openai_responses::DEFAULT_MAX_OUTPUT_TOKENS);
-            let reasoning_effort = cfg.and_then(|c| c.reasoning_effort.clone());
-            let api_key_env = cfg.and_then(|c| c.api_key_env.clone());
+            let options = openai_responses::ResponsesOptions {
+                reasoning_effort: cfg.and_then(|c| c.reasoning_effort.clone()),
+                api_key_env: cfg.and_then(|c| c.api_key_env.clone()),
+                prompt_cache: cfg.and_then(|c| c.prompt_cache),
+                prompt_cache_ttl: cfg.and_then(|c| c.prompt_cache_ttl.clone()),
+                bedrock_token: cfg.is_some_and(|c| c.bedrock_token),
+            };
 
             Ok(Arc::new(openai_responses::OpenAiResponsesClient::new(
                 base_url,
@@ -617,8 +622,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 context_window,
                 max_tokens,
                 ai.api_timeout_secs,
-                reasoning_effort,
-                api_key_env,
+                options,
             )?))
         }
         "ollama" => {
